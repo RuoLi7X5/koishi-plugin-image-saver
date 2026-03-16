@@ -1,0 +1,22 @@
+{
+  "name": "koishi-plugin-image-saver",
+  "description": "群内存图/更图插件：一条指令存入图片，一条指令发出图片，每群独立隔离",
+  "version": "1.0.0",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc"
+  },
+  "koishi": {
+    "description": {
+      "zh": "群内存图/更图插件：指令可配置，每群独立一张图，存图自动覆盖"
+    }
+  },
+  "peerDependencies": {
+    "koishi": "^4.17.0"
+  }
+}

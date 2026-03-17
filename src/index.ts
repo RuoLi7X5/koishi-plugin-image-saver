@@ -185,6 +185,22 @@ export function apply(ctx: Context, config: Config) {
     return typeof url === "string" && url ? url : null;
   }
 
+  /**
+   * 从 session 中提取第一个图片 URL。
+   * 同时检查消息本身（session.elements）和引用消息（session.quote.elements）。
+   *
+   * 背景：Koishi 中用户引用一条消息时，<quote> 元素的 children 并不包含被引用消息的
+   * 真实内容，被引用消息的元素单独存放在 session.quote.elements 里，
+   * 因此必须两处都检查才能可靠地拿到引用消息中的图片。
+   */
+  function extractImageFromSession(session: any): string | null {
+    // 1. 消息主体（包含直接发送的图片）
+    const fromMsg = extractFirstImageUrl(session?.elements ?? []);
+    if (fromMsg) return fromMsg;
+    // 2. 引用消息（session.quote.elements 由 Koishi 适配器填充）
+    return extractFirstImageUrl(session?.quote?.elements ?? []);
+  }
+
   // ── 等待状态表（guildId:userId -> timer） ────────────────────────────────
   const pending = new Map<string, PendingEntry>();
 
@@ -216,12 +232,17 @@ export function apply(ctx: Context, config: Config) {
     if (!matchedKey) return next();
 
     // 检查消息中是否包含图片（直接发图 或 引用含图消息）
-    const imgUrl = extractFirstImageUrl(session.elements ?? []);
+    const imgUrl = extractImageFromSession(session);
     if (!imgUrl) return next();
 
-    // 取消超时定时器，删除等待状态
-    clearTimeout(pending.get(matchedKey)!.timer);
-    pending.delete(matchedKey);
+    // 清除该群所有等待状态（防止多人同时 pending 时下一张图再次被捕捉覆盖）
+    const guildPrefix = `${session.guildId}:`;
+    for (const k of [...pending.keys()]) {
+      if (k.startsWith(guildPrefix)) {
+        clearTimeout(pending.get(k)!.timer);
+        pending.delete(k);
+      }
+    }
 
     try {
       await saveImageForGuild(session.guildId, imgUrl);
@@ -236,8 +257,17 @@ export function apply(ctx: Context, config: Config) {
   // ── 钩子：捕捉 bot 自身发出的图片（等待期间） ───────────────────────────────
   // ctx.middleware 只处理外部传入消息，bot 发出的消息需用 send 事件另行捕捉
   ctx.on("send", (session) => {
-    if (!config.captureAny) return;          // 严格模式下不捕捉 bot 发图
-    const guildId = session.guildId;
+    // 诊断：记录每次 send 事件触发情况，便于排查
+    const guildId = session?.guildId ?? session?.channelId;
+    const elemCount = session?.elements?.length ?? 0;
+    logger.debug(
+      `[send] 触发 guildId=${guildId ?? "无"} ` +
+      `elements=${elemCount} ` +
+      `content=${session?.content?.slice(0, 60) ?? "空"} ` +
+      `pending=${pending.size}`,
+    );
+
+    if (!config.captureAny) return;
     if (!guildId) return;
 
     // 查找该群是否有待处理的存图请求
@@ -248,12 +278,28 @@ export function apply(ctx: Context, config: Config) {
     }
     if (!matchedKey) return;
 
-    const imgUrl = extractFirstImageUrl(session.elements ?? []);
-    if (!imgUrl) return;
+    // elements 为空时尝试解析 content（部分 Koishi 版本 send 事件里 elements 不填充）
+    let elements = session.elements ?? [];
+    if (elements.length === 0 && session.content) {
+      try { elements = h.parse(session.content); } catch {}
+    }
 
-    // 先清除等待状态，再异步保存（防止循环触发）
-    clearTimeout(pending.get(matchedKey)!.timer);
-    pending.delete(matchedKey);
+    // 同时检查 session.quote（bot 发图通常无 quote，但保持与其他路径逻辑一致）
+    const imgUrl =
+      extractFirstImageUrl(elements) ||
+      extractFirstImageUrl(session?.quote?.elements ?? []);
+    if (!imgUrl) {
+      logger.debug("[send] 有待处理请求但消息中未检测到图片");
+      return;
+    }
+
+    // 清除该群所有等待状态（防止多人同时 pending 时下一张图再次被捕捉覆盖）
+    for (const k of [...pending.keys()]) {
+      if (k.startsWith(prefix)) {
+        clearTimeout(pending.get(k)!.timer);
+        pending.delete(k);
+      }
+    }
 
     saveImageForGuild(guildId, imgUrl)
       .then(() => session.bot?.sendMessage(guildId, "✅ 存图成功！").catch(() => {}))
@@ -267,7 +313,7 @@ export function apply(ctx: Context, config: Config) {
       if (!session!.guildId) return "此指令仅限群聊使用";
 
       // 优先检查指令消息本身是否已附带图片（引用含图消息时直接捕获）
-      const imgUrl = extractFirstImageUrl(session!.elements ?? []);
+      const imgUrl = extractImageFromSession(session);
       if (imgUrl) {
         try {
           await saveImageForGuild(session!.guildId, imgUrl);

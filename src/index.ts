@@ -10,6 +10,7 @@ export interface Config {
   saveCommand: string;
   getCommand: string;
   waitTimeout: number;
+  captureAny: boolean;
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -24,6 +25,9 @@ export const Config: Schema<Config> = Schema.object({
     .min(10)
     .max(300)
     .description("等待用户发送图片的超时时间（秒）"),
+  captureAny: Schema.boolean()
+    .default(true)
+    .description("等待期间群内任何人发的图片都可被存入（关闭后仅限发指令的人）"),
 }).description("指令设置");
 
 // ── 内部类型 ─────────────────────────────────────────────────────────────────
@@ -177,19 +181,30 @@ export function apply(ctx: Context, config: Config) {
   // prepend=true：在指令处理器之前运行，确保能捕获到图片消息
   ctx.middleware(async (session, next) => {
     if (!session.guildId) return next();
-    const key = `${session.guildId}:${session.userId}`;
-    if (!pending.has(key)) return next();
+
+    // 根据 captureAny 决定匹配策略：
+    //   开启时：查找该群是否存在任何待处理请求（不限发指令的人）
+    //   关闭时：仅匹配发出存图指令的那个用户
+    let matchedKey: string | undefined;
+    if (config.captureAny) {
+      const prefix = `${session.guildId}:`;
+      for (const k of pending.keys()) {
+        if (k.startsWith(prefix)) { matchedKey = k; break; }
+      }
+    } else {
+      const k = `${session.guildId}:${session.userId}`;
+      if (pending.has(k)) matchedKey = k;
+    }
+
+    if (!matchedKey) return next();
 
     // 检查消息中是否包含图片（直接发图 或 引用含图消息）
     const imgUrl = extractFirstImageUrl(session.elements ?? []);
-    if (!imgUrl) {
-      // 非图片消息，继续传递给后续中间件/指令处理器
-      return next();
-    }
+    if (!imgUrl) return next();
 
     // 取消超时定时器，删除等待状态
-    clearTimeout(pending.get(key)!.timer);
-    pending.delete(key);
+    clearTimeout(pending.get(matchedKey)!.timer);
+    pending.delete(matchedKey);
 
     try {
       await saveImageForGuild(session.guildId, imgUrl);
@@ -207,6 +222,19 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session }) => {
       if (!session!.guildId) return "此指令仅限群聊使用";
 
+      // 优先检查指令消息本身是否已附带图片（引用含图消息时直接捕获）
+      const imgUrl = extractFirstImageUrl(session!.elements ?? []);
+      if (imgUrl) {
+        try {
+          await saveImageForGuild(session!.guildId, imgUrl);
+          return "✅ 存图成功！";
+        } catch (err: any) {
+          logger.error("存图失败：", err);
+          return `❌ 存图失败：${err?.message ?? "未知错误"}`;
+        }
+      }
+
+      // 当前消息无图片，进入等待模式
       const key = `${session!.guildId}:${session!.userId}`;
 
       // 若用户已有待处理请求，先取消旧的

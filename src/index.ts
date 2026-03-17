@@ -59,11 +59,28 @@ function detectExt(buf: Buffer, contentType: string): string {
 }
 
 /**
- * 下载远端图片（自动跟随一次 301/302 重定向）
+ * 下载/解码图片，支持 http/https、data URI（base64）、file:// 三种来源
  */
 async function downloadImage(url: string, depth = 0): Promise<{ buf: Buffer; ext: string }> {
   if (depth > 3) throw new Error("重定向次数过多");
 
+  // ── data URI（base64 编码）────────────────────────────────────────────────
+  if (url.startsWith("data:")) {
+    const match = url.match(/^data:([^;]+);base64,(.+)$/s);
+    if (!match) throw new Error("无效的 data URI");
+    const buf = Buffer.from(match[2], "base64");
+    return { buf, ext: detectExt(buf, match[1]) };
+  }
+
+  // ── file:// URL（bot 发图时常见）──────────────────────────────────────────
+  if (url.startsWith("file://")) {
+    const { fileURLToPath } = require("url") as typeof import("url");
+    const fsp = require("fs").promises as typeof import("fs").promises;
+    const buf = await fsp.readFile(fileURLToPath(url));
+    return { buf, ext: detectExt(buf, "") };
+  }
+
+  // ── http / https ──────────────────────────────────────────────────────────
   return new Promise((resolve, reject) => {
     const lib: typeof import("https") = url.startsWith("https")
       ? require("https")
@@ -215,6 +232,33 @@ export function apply(ctx: Context, config: Config) {
     }
     // 不调用 next()，此消息已被消费
   }, true);
+
+  // ── 钩子：捕捉 bot 自身发出的图片（等待期间） ───────────────────────────────
+  // ctx.middleware 只处理外部传入消息，bot 发出的消息需用 send 事件另行捕捉
+  ctx.on("send", (session) => {
+    if (!config.captureAny) return;          // 严格模式下不捕捉 bot 发图
+    const guildId = session.guildId;
+    if (!guildId) return;
+
+    // 查找该群是否有待处理的存图请求
+    const prefix = `${guildId}:`;
+    let matchedKey: string | undefined;
+    for (const k of pending.keys()) {
+      if (k.startsWith(prefix)) { matchedKey = k; break; }
+    }
+    if (!matchedKey) return;
+
+    const imgUrl = extractFirstImageUrl(session.elements ?? []);
+    if (!imgUrl) return;
+
+    // 先清除等待状态，再异步保存（防止循环触发）
+    clearTimeout(pending.get(matchedKey)!.timer);
+    pending.delete(matchedKey);
+
+    saveImageForGuild(guildId, imgUrl)
+      .then(() => session.bot?.sendMessage(guildId, "✅ 存图成功！").catch(() => {}))
+      .catch((err: any) => logger.error("存图失败（bot 发图）：", err));
+  });
 
   // ── 指令：存图 ───────────────────────────────────────────────────────────────
   ctx

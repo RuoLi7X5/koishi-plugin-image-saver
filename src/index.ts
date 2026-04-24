@@ -1,6 +1,6 @@
 import { Context, Schema, h } from "koishi";
 import { join } from "path";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 
 export const name = "image-saver";
 
@@ -9,8 +9,13 @@ export const name = "image-saver";
 export interface Config {
   saveCommand: string;
   getCommand: string;
-  waitTimeout: number;
-  captureAny: boolean;
+  modeCommand: string;
+  bindMode: "guild" | "user";
+  modeAdminUserIds: string[];
+  guildModeOverrides: {
+    guildId: string;
+    mode: "guild" | "user";
+  }[];
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -20,21 +25,32 @@ export const Config: Schema<Config> = Schema.object({
   getCommand: Schema.string()
     .default("更图")
     .description("发出已保存图片的指令名称"),
-  waitTimeout: Schema.number()
-    .default(60)
-    .min(10)
-    .max(300)
-    .description("等待用户发送图片的超时时间（秒）"),
-  captureAny: Schema.boolean()
-    .default(true)
-    .description("等待期间群内任何人发的图片都可被存入（关闭后仅限发指令的人）"),
+  modeCommand: Schema.string()
+    .default("存图模式")
+    .description("切换当前群存图模式的管理员指令名称"),
+  bindMode: Schema.union([
+    Schema.const("guild").description("群聊共享模式：同一群共用一张图"),
+    Schema.const("user").description("群内个人模式：同一群内每人各存一张图"),
+  ] as const)
+    .default("guild")
+    .description("存图绑定模式"),
+  modeAdminUserIds: Schema.array(Schema.string().required())
+    .role("table")
+    .default([])
+    .description("可执行模式切换指令的管理员 QQ 号（userId）白名单"),
+  guildModeOverrides: Schema.array(
+    Schema.object({
+      guildId: Schema.string().required().description("群 ID"),
+      mode: Schema.union([
+        Schema.const("guild").description("群聊共享"),
+        Schema.const("user").description("群内个人"),
+      ] as const).required().description("该群绑定模式"),
+    }),
+  )
+    .role("table")
+    .default([])
+    .description("按群覆盖绑定模式（未匹配时使用默认 bindMode）"),
 }).description("指令设置");
-
-// ── 内部类型 ─────────────────────────────────────────────────────────────────
-
-interface PendingEntry {
-  timer: ReturnType<typeof setTimeout>;
-}
 
 // ── 工具函数 ─────────────────────────────────────────────────────────────────
 
@@ -126,17 +142,21 @@ async function downloadImage(url: string, depth = 0): Promise<{ buf: Buffer; ext
   });
 }
 
-/**
- * 将 guildId 转成安全的文件名（去掉非法字符）
- */
-function safeGuildId(guildId: string): string {
-  return guildId.replace(/[^\w-]/g, "_");
+/** 将任意作用域键转成安全文件名（去掉非法字符） */
+function safeScopeKey(scopeKey: string): string {
+  return scopeKey.replace(/[^\w-]/g, "_");
 }
 
 // ── 插件入口 ─────────────────────────────────────────────────────────────────
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger("image-saver");
+  const modeAdminSet = new Set((config.modeAdminUserIds ?? []).map(id => id.trim()).filter(Boolean));
+  const guildModeMap = new Map<string, "guild" | "user">(
+    (config.guildModeOverrides ?? [])
+      .filter(item => item?.guildId)
+      .map(item => [item.guildId, item.mode]),
+  );
 
   // ── 存储目录 ────────────────────────────────────────────────────────────────
   function getStorageDir(): string {
@@ -147,9 +167,53 @@ export function apply(ctx: Context, config: Config) {
     return dir;
   }
 
-  /** 查找该群已存的图片路径，不存在返回 null */
-  function findSavedImage(guildId: string): string | null {
-    const base = join(getStorageDir(), safeGuildId(guildId));
+  const runtimeModePath = join(getStorageDir(), "guild-mode-overrides.json");
+  const runtimeModeMap = new Map<string, "guild" | "user">();
+
+  function loadRuntimeModeOverrides() {
+    if (!existsSync(runtimeModePath)) return;
+    try {
+      const raw = readFileSync(runtimeModePath, "utf8");
+      const parsed = JSON.parse(raw) as Record<string, "guild" | "user">;
+      for (const [guildId, mode] of Object.entries(parsed)) {
+        if (mode === "guild" || mode === "user") {
+          runtimeModeMap.set(guildId, mode);
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`[模式覆盖] 读取失败，已忽略：${err?.message ?? err}`);
+    }
+  }
+
+  function saveRuntimeModeOverrides() {
+    const data: Record<string, "guild" | "user"> = {};
+    for (const [guildId, mode] of runtimeModeMap.entries()) data[guildId] = mode;
+    writeFileSync(runtimeModePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  }
+
+  function normalizeMode(input?: string): "guild" | "user" | null {
+    const text = (input ?? "").trim().toLowerCase();
+    if (!text) return null;
+    if (["guild", "shared", "share", "g", "共享", "群共享", "群聊共享"].includes(text)) return "guild";
+    if (["user", "private", "u", "个人", "独立", "群内个人", "按人"].includes(text)) return "user";
+    return null;
+  }
+
+  function getModeLabel(mode: "guild" | "user"): string {
+    return mode === "user" ? "群内个人模式" : "群共享模式";
+  }
+
+  function canUseModeCommand(session: any): boolean {
+    const userId = session?.userId;
+    if (!userId) return false;
+    return modeAdminSet.has(String(userId));
+  }
+
+  loadRuntimeModeOverrides();
+
+  /** 查找该作用域已存的图片路径，不存在返回 null */
+  function findSavedImage(scopeKey: string): string | null {
+    const base = join(getStorageDir(), safeScopeKey(scopeKey));
     for (const ext of ["png", "jpg", "jpeg", "gif", "webp"]) {
       const p = `${base}.${ext}`;
       if (existsSync(p)) return p;
@@ -157,12 +221,12 @@ export function apply(ctx: Context, config: Config) {
     return null;
   }
 
-  /** 下载图片并保存（覆盖该群旧图） */
-  async function saveImageForGuild(guildId: string, url: string): Promise<void> {
+  /** 下载图片并保存（覆盖该作用域旧图） */
+  async function saveImageForScope(scopeKey: string, url: string): Promise<void> {
     const fsp = require("fs").promises as typeof import("fs").promises;
     const { buf, ext } = await downloadImage(url);
     const dir = getStorageDir();
-    const base = join(dir, safeGuildId(guildId));
+    const base = join(dir, safeScopeKey(scopeKey));
 
     // 删除旧格式文件
     for (const oldExt of ["png", "jpg", "jpeg", "gif", "webp"]) {
@@ -171,8 +235,19 @@ export function apply(ctx: Context, config: Config) {
 
     await fsp.writeFile(`${base}.${ext}`, buf);
     logger.info(
-      `[存图] 群 ${guildId} 保存成功（${(buf.length / 1024).toFixed(0)} KB，格式 ${ext}）`,
+      `[存图] 作用域 ${scopeKey} 保存成功（${(buf.length / 1024).toFixed(0)} KB，格式 ${ext}）`,
     );
+  }
+
+  function resolveBindMode(guildId: string): "guild" | "user" {
+    if (runtimeModeMap.has(guildId)) return runtimeModeMap.get(guildId)!;
+    return guildModeMap.get(guildId) ?? config.bindMode;
+  }
+
+  function getScopeKey(guildId: string, userId: string): string {
+    const bindMode = resolveBindMode(guildId);
+    if (bindMode === "user") return `g_${guildId}_u_${userId}`;
+    return `g_${guildId}`;
   }
 
   /**
@@ -185,165 +260,40 @@ export function apply(ctx: Context, config: Config) {
     return typeof url === "string" && url ? url : null;
   }
 
-  /**
-   * 从 session 中提取第一个图片 URL。
-   * 同时检查消息本身（session.elements）和引用消息（session.quote.elements）。
-   *
-   * 背景：Koishi 中用户引用一条消息时，<quote> 元素的 children 并不包含被引用消息的
-   * 真实内容，被引用消息的元素单独存放在 session.quote.elements 里，
-   * 因此必须两处都检查才能可靠地拿到引用消息中的图片。
-   */
-  function extractImageFromSession(session: any): string | null {
-    // 1. 消息主体（包含直接发送的图片）
-    const fromMsg = extractFirstImageUrl(session?.elements ?? []);
-    if (fromMsg) return fromMsg;
-    // 2. 引用消息（session.quote.elements 由 Koishi 适配器填充）
+  /** 仅允许从引用消息提取图片 URL。 */
+  function extractImageFromQuote(session: any): string | null {
     return extractFirstImageUrl(session?.quote?.elements ?? []);
   }
 
-  // ── 等待状态表（guildId:userId -> timer） ────────────────────────────────
-  const pending = new Map<string, PendingEntry>();
-
-  // 插件卸载时清理所有定时器
-  ctx.on("dispose", () => {
-    for (const entry of pending.values()) clearTimeout(entry.timer);
-    pending.clear();
-  });
-
-  // ── 中间件：拦截等待图片的用户消息 ──────────────────────────────────────────
-  // prepend=true：在指令处理器之前运行，确保能捕获到图片消息
+  // 兼容中文/英文感叹号命令前缀：将开头全角 ！ 归一化为半角 !
   ctx.middleware(async (session, next) => {
-    if (!session.guildId) return next();
-
-    // 根据 captureAny 决定匹配策略：
-    //   开启时：查找该群是否存在任何待处理请求（不限发指令的人）
-    //   关闭时：仅匹配发出存图指令的那个用户
-    let matchedKey: string | undefined;
-    if (config.captureAny) {
-      const prefix = `${session.guildId}:`;
-      for (const k of pending.keys()) {
-        if (k.startsWith(prefix)) { matchedKey = k; break; }
-      }
-    } else {
-      const k = `${session.guildId}:${session.userId}`;
-      if (pending.has(k)) matchedKey = k;
+    if (session.content?.startsWith("！")) {
+      session.content = `!${session.content.slice(1)}`;
     }
-
-    if (!matchedKey) return next();
-
-    // 检查消息中是否包含图片（直接发图 或 引用含图消息）
-    const imgUrl = extractImageFromSession(session);
-    if (!imgUrl) return next();
-
-    // 清除该群所有等待状态（防止多人同时 pending 时下一张图再次被捕捉覆盖）
-    const guildPrefix = `${session.guildId}:`;
-    for (const k of [...pending.keys()]) {
-      if (k.startsWith(guildPrefix)) {
-        clearTimeout(pending.get(k)!.timer);
-        pending.delete(k);
-      }
-    }
-
-    try {
-      await saveImageForGuild(session.guildId, imgUrl);
-      await session.send("✅ 存图成功！");
-    } catch (err: any) {
-      logger.error("存图失败：", err);
-      await session.send(`❌ 存图失败：${err?.message ?? "未知错误"}`);
-    }
-    // 不调用 next()，此消息已被消费
+    return next();
   }, true);
-
-  // ── 钩子：捕捉 bot 自身发出的图片（等待期间） ───────────────────────────────
-  // ctx.middleware 只处理外部传入消息，bot 发出的消息需用 send 事件另行捕捉
-  ctx.on("send", (session) => {
-    // 诊断：记录每次 send 事件触发情况，便于排查
-    const guildId = session?.guildId ?? session?.channelId;
-    const elemCount = session?.elements?.length ?? 0;
-    logger.debug(
-      `[send] 触发 guildId=${guildId ?? "无"} ` +
-      `elements=${elemCount} ` +
-      `content=${session?.content?.slice(0, 60) ?? "空"} ` +
-      `pending=${pending.size}`,
-    );
-
-    if (!config.captureAny) return;
-    if (!guildId) return;
-
-    // 查找该群是否有待处理的存图请求
-    const prefix = `${guildId}:`;
-    let matchedKey: string | undefined;
-    for (const k of pending.keys()) {
-      if (k.startsWith(prefix)) { matchedKey = k; break; }
-    }
-    if (!matchedKey) return;
-
-    // elements 为空时尝试解析 content（部分 Koishi 版本 send 事件里 elements 不填充）
-    let elements = session.elements ?? [];
-    if (elements.length === 0 && session.content) {
-      try { elements = h.parse(session.content); } catch {}
-    }
-
-    // 同时检查 session.quote（bot 发图通常无 quote，但保持与其他路径逻辑一致）
-    const imgUrl =
-      extractFirstImageUrl(elements) ||
-      extractFirstImageUrl(session?.quote?.elements ?? []);
-    if (!imgUrl) {
-      logger.debug("[send] 有待处理请求但消息中未检测到图片");
-      return;
-    }
-
-    // 清除该群所有等待状态（防止多人同时 pending 时下一张图再次被捕捉覆盖）
-    for (const k of [...pending.keys()]) {
-      if (k.startsWith(prefix)) {
-        clearTimeout(pending.get(k)!.timer);
-        pending.delete(k);
-      }
-    }
-
-    saveImageForGuild(guildId, imgUrl)
-      .then(() => session.bot?.sendMessage(guildId, "✅ 存图成功！").catch(() => {}))
-      .catch((err: any) => logger.error("存图失败（bot 发图）：", err));
-  });
 
   // ── 指令：存图 ───────────────────────────────────────────────────────────────
   ctx
     .command(config.saveCommand, "将下一条图片保存到本群（指令名可在配置中修改）")
     .action(async ({ session }) => {
       if (!session!.guildId) return "此指令仅限群聊使用";
+      if (!session!.userId) return "无法获取用户信息";
 
-      // 优先检查指令消息本身是否已附带图片（引用含图消息时直接捕获）
-      const imgUrl = extractImageFromSession(session);
-      if (imgUrl) {
-        try {
-          await saveImageForGuild(session!.guildId, imgUrl);
-          return "✅ 存图成功！";
-        } catch (err: any) {
-          logger.error("存图失败：", err);
-          return `❌ 存图失败：${err?.message ?? "未知错误"}`;
-        }
+      // 仅允许“引用含图消息”进行存图，不再支持发送指令后等待下一条图片。
+      const imgUrl = extractImageFromQuote(session);
+      const scopeKey = getScopeKey(session!.guildId, session!.userId);
+      if (!imgUrl) {
+        return "请使用“引用含图消息 + 存图”进行保存";
       }
 
-      // 当前消息无图片，进入等待模式
-      const key = `${session!.guildId}:${session!.userId}`;
-
-      // 若用户已有待处理请求，先取消旧的
-      if (pending.has(key)) {
-        clearTimeout(pending.get(key)!.timer);
-        pending.delete(key);
+      try {
+        await saveImageForScope(scopeKey, imgUrl);
+        return "✅ 存图成功！";
+      } catch (err: any) {
+        logger.error("存图失败：", err);
+        return `❌ 存图失败：${err?.message ?? "未知错误"}`;
       }
-
-      const timeoutMs = config.waitTimeout * 1000;
-      const timer = setTimeout(async () => {
-        pending.delete(key);
-        try {
-          await session!.send(`⏰ 已超过 ${config.waitTimeout} 秒未收到图片，存图已取消`);
-        } catch {}
-      }, timeoutMs);
-
-      pending.set(key, { timer });
-
-      return `📷 请在 ${config.waitTimeout} 秒内发送或引用含图的消息`;
     });
 
   // ── 指令：更图 ───────────────────────────────────────────────────────────────
@@ -351,9 +301,15 @@ export function apply(ctx: Context, config: Config) {
     .command(config.getCommand, "发出本群已保存的图片（指令名可在配置中修改）")
     .action(async ({ session }) => {
       if (!session!.guildId) return "此指令仅限群聊使用";
+      if (!session!.userId) return "无法获取用户信息";
 
-      const imgPath = findSavedImage(session!.guildId);
-      if (!imgPath) return "本群暂无存图，请先使用存图指令保存一张图片";
+      const scopeKey = getScopeKey(session!.guildId, session!.userId);
+      const imgPath = findSavedImage(scopeKey);
+      if (!imgPath) {
+        return resolveBindMode(session!.guildId) === "user"
+          ? "你在本群还没有存图，请先使用存图指令保存一张图片"
+          : "本群暂无存图，请先使用存图指令保存一张图片";
+      }
 
       try {
         const fsp = require("fs").promises as typeof import("fs").promises;
@@ -381,5 +337,29 @@ export function apply(ctx: Context, config: Config) {
         logger.error("更图失败：", err);
         return `❌ 更图失败：${err?.message ?? "未知错误"}`;
       }
+    });
+
+  // ── 指令：存图模式（管理员）──────────────────────────────────────────────────
+  ctx
+    .command(`${config.modeCommand} [mode:string]`, "管理员切换当前群存图模式（共享/个人）")
+    .action(async ({ session }, modeText) => {
+      if (!session?.guildId) return "此指令仅限群聊使用";
+      if (!canUseModeCommand(session)) return;
+
+      const guildId = session.guildId;
+      const normalizedMode = normalizeMode(modeText);
+      if (!normalizedMode) {
+        const current = resolveBindMode(guildId);
+        return `当前模式：${getModeLabel(current)}\n用法：${config.modeCommand} 共享 或 ${config.modeCommand} 个人`;
+      }
+
+      runtimeModeMap.set(guildId, normalizedMode);
+      try {
+        saveRuntimeModeOverrides();
+      } catch (err: any) {
+        logger.error("保存群模式覆盖失败：", err);
+        return `❌ 切换失败：${err?.message ?? "写入配置失败"}`;
+      }
+      return `✅ 已切换为${getModeLabel(normalizedMode)}`;
     });
 }

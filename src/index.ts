@@ -387,6 +387,16 @@ export function apply(ctx: Context, config: Config) {
     seen.add(input);
 
     const obj = input as Record<string, any>;
+
+    // 优先从消息文本/原始消息里解析 reply 标记，避免误拿当前消息 message_id
+    for (const key of ["raw_message", "content", "message", "text"]) {
+      const value = obj[key];
+      if (typeof value === "string") {
+        const found = extractReplyIdFromContent(value);
+        if (found) return found;
+      }
+    }
+
     for (const key of ["id", "messageId", "msgId", "message_id"]) {
       const value = obj[key];
       if (typeof value === "string" || typeof value === "number") {
@@ -513,6 +523,8 @@ export function apply(ctx: Context, config: Config) {
       session?.quote?.messageId ??
       extractReplyIdFromUnknown(session?.event?.reply) ??
       extractReplyIdFromUnknown(session?.event?.quote) ??
+      extractReplyIdFromUnknown(session?.event?._data ?? session?.event?.raw) ??
+      extractReplyIdFromContent(session?.event?._data?.raw_message ?? session?.event?.raw?.raw_message) ??
       extractReplyIdFromUnknown(quoteNodes) ??
       extractReplyIdFromContent(rawContent) ??
       extractReplyIdFromContent(session?.content);

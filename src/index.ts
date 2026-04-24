@@ -208,6 +208,15 @@ export function apply(ctx: Context, config: Config) {
     return normalized || fallback;
   }
 
+  function buildBangTriggers(commandName: string): string[] {
+    return [...new Set([
+      `!${commandName}`,
+      `！${commandName}`,
+      `﹗${commandName}`,
+      `︕${commandName}`,
+    ])];
+  }
+
   function escapeRegExp(text: string): string {
     return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
@@ -215,9 +224,12 @@ export function apply(ctx: Context, config: Config) {
   const saveCommandName = normalizeCommandName(config.saveCommand, "存图");
   const getCommandName = normalizeCommandName(config.getCommand, "更图");
   const modeCommandName = normalizeCommandName(config.modeCommand, "存图模式");
-  const saveCommandTrigger = `!${saveCommandName}`;
-  const getCommandTrigger = `!${getCommandName}`;
-  const modeCommandTrigger = `!${modeCommandName}`;
+  const saveCommandTriggers = buildBangTriggers(saveCommandName);
+  const getCommandTriggers = buildBangTriggers(getCommandName);
+  const modeCommandTriggers = buildBangTriggers(modeCommandName);
+  const saveCommandTrigger = saveCommandTriggers[0];
+  const getCommandTrigger = getCommandTriggers[0];
+  const modeCommandTrigger = modeCommandTriggers[0];
 
   function canUseModeCommand(session: any): boolean {
     const userId = session?.userId;
@@ -271,9 +283,159 @@ export function apply(ctx: Context, config: Config) {
    * h.select 会递归搜索，可处理引用消息中的图片。
    */
   function extractFirstImageUrl(elements: h[]): string | null {
-    const imgs = h.select(elements, "img");
-    const url = imgs[0]?.attrs?.src;
-    return typeof url === "string" && url ? url : null;
+    const nodes = [
+      ...h.select(elements, "img"),
+      ...h.select(elements, "image"),
+    ];
+    for (const node of nodes) {
+      const attrs: any = (node as any)?.attrs ?? {};
+      const candidates = [attrs.src, attrs.url, attrs.file];
+      for (const value of candidates) {
+        if (typeof value === "string" && value) return value;
+      }
+    }
+    return null;
+  }
+
+  function extractImageFromContentString(content?: string): string | null {
+    if (!content) return null;
+    try {
+      const fromParsed = extractFirstImageUrl(h.parse(content));
+      if (fromParsed) return fromParsed;
+    } catch {}
+
+    // onebot 常见格式：[CQ:image,file=...,url=...]
+    const urlMatch = content.match(/\[CQ:image,[^\]]*url=([^,\]]+)[^\]]*\]/i);
+    if (urlMatch?.[1]) return decodeURIComponent(urlMatch[1]);
+    const fileMatch = content.match(/\[CQ:image,[^\]]*file=([^,\]]+)[^\]]*\]/i);
+    if (fileMatch?.[1]) return decodeURIComponent(fileMatch[1]);
+    return null;
+  }
+
+  function isImageLikeUrl(value: string): boolean {
+    if (!value) return false;
+    return /^(https?:\/\/|file:\/\/|data:image\/)/i.test(value);
+  }
+
+  function extractImageFromUnknown(input: any, depth = 0, seen = new WeakSet<object>()): string | null {
+    if (input == null || depth > 6) return null;
+
+    if (typeof input === "string") {
+      const fromContent = extractImageFromContentString(input);
+      if (fromContent) return fromContent;
+      return isImageLikeUrl(input) ? input : null;
+    }
+
+    if (Array.isArray(input)) {
+      for (const item of input) {
+        const found = extractImageFromUnknown(item, depth + 1, seen);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    if (typeof input !== "object") return null;
+    if (seen.has(input)) return null;
+    seen.add(input);
+
+    const obj = input as Record<string, any>;
+
+    // 优先扫描常见图片字段
+    for (const key of ["src", "url", "file", "path", "downloadUrl", "resourceUrl"]) {
+      const value = obj[key];
+      if (typeof value === "string") {
+        const found = extractImageFromUnknown(value, depth + 1, seen);
+        if (found) return found;
+      }
+    }
+
+    // 常见消息结构字段
+    for (const key of ["attrs", "children", "elements", "quote", "content", "message", "data"]) {
+      if (key in obj) {
+        const found = extractImageFromUnknown(obj[key], depth + 1, seen);
+        if (found) return found;
+      }
+    }
+
+    for (const [key, value] of Object.entries(obj)) {
+      if (["src", "url", "file", "path", "downloadUrl", "resourceUrl", "attrs", "children", "elements", "quote", "content", "message", "data"].includes(key)) {
+        continue;
+      }
+      const found = extractImageFromUnknown(value, depth + 1, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function extractReplyIdFromUnknown(input: any, depth = 0, seen = new WeakSet<object>()): string | null {
+    if (input == null || depth > 6) return null;
+
+    if (typeof input === "string") {
+      return extractReplyIdFromContent(input);
+    }
+
+    if (Array.isArray(input)) {
+      for (const item of input) {
+        const found = extractReplyIdFromUnknown(item, depth + 1, seen);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    if (typeof input !== "object") return null;
+    if (seen.has(input)) return null;
+    seen.add(input);
+
+    const obj = input as Record<string, any>;
+    for (const key of ["id", "messageId", "msgId", "message_id"]) {
+      const value = obj[key];
+      if (typeof value === "string" || typeof value === "number") {
+        return String(value);
+      }
+    }
+
+    for (const key of ["quote", "reply", "source", "message", "data", "attrs", "children", "elements", "content", "event"]) {
+      if (key in obj) {
+        const found = extractReplyIdFromUnknown(obj[key], depth + 1, seen);
+        if (found) return found;
+      }
+    }
+
+    for (const value of Object.values(obj)) {
+      const found = extractReplyIdFromUnknown(value, depth + 1, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function summarizeValue(input: any, depth = 0, seen = new WeakSet<object>()): string {
+    if (input == null) return String(input);
+    if (typeof input === "string") return input.slice(0, 160);
+    if (typeof input === "number" || typeof input === "boolean") return String(input);
+    if (Array.isArray(input)) return `Array(len=${input.length})`;
+    if (typeof input !== "object") return typeof input;
+    if (seen.has(input)) return "[Circular]";
+    seen.add(input);
+    if (depth > 1) return `Object(keys=${Object.keys(input).slice(0, 12).join(",")})`;
+    const obj = input as Record<string, any>;
+    const preview: Record<string, string> = {};
+    for (const key of Object.keys(obj).slice(0, 10)) {
+      preview[key] = summarizeValue(obj[key], depth + 1, seen);
+    }
+    try {
+      return JSON.stringify(preview);
+    } catch {
+      return `Object(keys=${Object.keys(obj).slice(0, 12).join(",")})`;
+    }
+  }
+
+  function extractReplyIdFromContent(content?: string): string | null {
+    if (!content) return null;
+    const cq = content.match(/\[CQ:reply,[^\]]*id=([^,\]]+)[^\]]*\]/i);
+    if (cq?.[1]) return cq[1];
+    const xml = content.match(/<quote\b[^>]*\bid="([^"]+)"[^>]*\/?>/i);
+    if (xml?.[1]) return xml[1];
+    return null;
   }
 
   /**
@@ -282,21 +444,115 @@ export function apply(ctx: Context, config: Config) {
    * 1) session.quote.elements
    * 2) session.elements 里的 <quote> 子树
    */
-  function extractImageFromQuote(session: any): string | null {
+  async function extractImageFromQuote(session: any): Promise<string | null> {
+    const diagnostics: string[] = [];
+
+    // 最高优先级：直接扫描整条消息元素树。
+    // 很多适配器会把“引用图片预览”直接展开进当前消息 elements，
+    // 但不一定同步填充 session.quote。
+    const fromSessionElements = extractFirstImageUrl(session?.elements ?? []);
+    if (fromSessionElements) return fromSessionElements;
+    diagnostics.push(`session.elements(img/image)=miss:${summarizeValue(session?.elements)}`);
+
+    const fromSessionUnknown = extractImageFromUnknown(session?.elements ?? []);
+    if (fromSessionUnknown) return fromSessionUnknown;
+    diagnostics.push("session.elements(recursive)=miss");
+
     const quoteElements = session?.quote?.elements ?? [];
     const fromQuoteField = extractFirstImageUrl(quoteElements);
     if (fromQuoteField) return fromQuoteField;
+    diagnostics.push(`session.quote.elements=miss:${summarizeValue(quoteElements)}`);
+
+    const fromQuoteUnknown = extractImageFromUnknown(session?.quote);
+    if (fromQuoteUnknown) return fromQuoteUnknown;
+    diagnostics.push(`session.quote(recursive)=miss:${summarizeValue(session?.quote)}`);
+
+    const fromEventReply = extractImageFromUnknown(session?.event?.reply);
+    if (fromEventReply) return fromEventReply;
+    diagnostics.push(`session.event.reply=miss:${summarizeValue(session?.event?.reply)}`);
+
+    const fromEventQuote = extractImageFromUnknown(session?.event?.quote);
+    if (fromEventQuote) return fromEventQuote;
+    diagnostics.push(`session.event.quote=miss:${summarizeValue(session?.event?.quote)}`);
+
+    const fromEventMessage = extractImageFromUnknown(session?.event?.message);
+    if (fromEventMessage) return fromEventMessage;
+    diagnostics.push(`session.event.message=miss:${summarizeValue(session?.event?.message)}`);
+
+    const fromEventRawMessage = extractImageFromUnknown(session?.event?._data ?? session?.event?.raw);
+    if (fromEventRawMessage) return fromEventRawMessage;
+    diagnostics.push(`session.event.raw=miss:${summarizeValue(session?.event?._data ?? session?.event?.raw)}`);
+
+    const fromQuoteMessage = extractImageFromUnknown(session?.quote?.message);
+    if (fromQuoteMessage) return fromQuoteMessage;
+    diagnostics.push(`session.quote.message=miss:${summarizeValue(session?.quote?.message)}`);
 
     const quoteNodes = h.select(session?.elements ?? [], "quote");
     for (const node of quoteNodes) {
       const fromQuoteNode = extractFirstImageUrl((node as any)?.children ?? []);
       if (fromQuoteNode) return fromQuoteNode;
+      const fromQuoteNodeUnknown = extractImageFromUnknown(node);
+      if (fromQuoteNodeUnknown) return fromQuoteNodeUnknown;
+      const fromQuoteAttrs = extractImageFromUnknown((node as any)?.attrs);
+      if (fromQuoteAttrs) return fromQuoteAttrs;
     }
+    diagnostics.push(`quoteNodes=miss:count=${quoteNodes.length}`);
+
+    const fromQuoteContent = extractImageFromContentString(session?.quote?.content);
+    if (fromQuoteContent) return fromQuoteContent;
+    diagnostics.push(`session.quote.content=miss:${summarizeValue(session?.quote?.content)}`);
+
+    const rawContent = session?.__imageSaverRawContent ?? session?.content;
+    const fromRawContent = extractImageFromContentString(rawContent);
+    if (fromRawContent) return fromRawContent;
+    diagnostics.push(`rawContent=miss:${summarizeValue(rawContent)}`);
+
+    // 兜底：按引用消息 ID 回查原消息（部分适配器不会在 quote 中附带元素树）
+    const quoteId =
+      session?.quote?.id ??
+      session?.quote?.messageId ??
+      extractReplyIdFromUnknown(session?.event?.reply) ??
+      extractReplyIdFromUnknown(session?.event?.quote) ??
+      extractReplyIdFromUnknown(quoteNodes) ??
+      extractReplyIdFromContent(rawContent) ??
+      extractReplyIdFromContent(session?.content);
+    diagnostics.push(`quoteId=${quoteId ?? "none"}`);
+    const channelId = session?.channelId;
+    const getMessage = session?.bot?.getMessage;
+    if (quoteId && channelId && typeof getMessage === "function") {
+      const tryFetches: Array<{ label: string; run: () => Promise<any> }> = [
+        { label: "getMessage(channelId, quoteId)", run: () => getMessage.call(session.bot, channelId, quoteId) },
+        { label: "getMessage(channelId, quoteId, guildId)", run: () => getMessage.call(session.bot, channelId, quoteId, session?.guildId) },
+        { label: "getMessage(quoteId, channelId)", run: () => getMessage.call(session.bot, quoteId, channelId) },
+        { label: "getMessage(quoteId, channelId, guildId)", run: () => getMessage.call(session.bot, quoteId, channelId, session?.guildId) },
+      ];
+      for (const item of tryFetches) {
+        try {
+          const quoted = await item.run();
+          const fromQuotedElements = extractFirstImageUrl(quoted?.elements ?? []);
+          if (fromQuotedElements) return fromQuotedElements;
+          const fromQuotedContent = extractImageFromContentString(quoted?.content);
+          if (fromQuotedContent) return fromQuotedContent;
+          const fromQuotedUnknown = extractImageFromUnknown(quoted);
+          if (fromQuotedUnknown) return fromQuotedUnknown;
+          diagnostics.push(`${item.label}=miss:${summarizeValue(quoted)}`);
+        } catch (err: any) {
+          diagnostics.push(`${item.label}=error:${err?.message ?? err}`);
+        }
+      }
+    } else {
+      diagnostics.push(`getMessage unavailable=${typeof getMessage !== "function"} channelId=${channelId ?? "none"}`);
+    }
+
+    logger.warn(
+      `[存图] 抓图失败。原因链路：${diagnostics.join(" | ")}`,
+    );
     return null;
   }
 
   // 兼容中文/英文感叹号命令前缀：将常见全角/变体叹号归一化为半角 !
   ctx.middleware(async (session, next) => {
+    (session as any).__imageSaverRawContent = session.content ?? "";
     if (session.content) {
       // 兼容：！(FF01)、﹗(FE57)、︕(FE15)
       session.content = session.content.replace(/[\uFF01\uFE57\uFE15]/g, "!");
@@ -307,7 +563,8 @@ export function apply(ctx: Context, config: Config) {
         .replace(/^(?:<quote\b[^>]*\/>\s*)+/i, "")
         .replace(/^(?:<at\b[^>]*\/>\s*)+/i, "")
         .replace(/^(?:\[CQ:(?:reply|at),[^\]]+\]\s*)+/i, "")
-        .replace(/^(?:@\S+\s*)+/, "");
+        // 只剥离开头的 @名字，不吞掉紧随其后的 !存图 / !更图
+        .replace(/^(?:@[^!\s]+\s*)+(?=!)/, "");
     }
     // 兼容 "! 存图"、"@bot! 存图" 这类写法，统一归一为 "!存图"
     if (session.content?.includes("!")) {
@@ -325,16 +582,20 @@ export function apply(ctx: Context, config: Config) {
   }, true);
 
   // ── 指令：存图 ───────────────────────────────────────────────────────────────
-  ctx
+  const saveCommand = ctx
     .command(saveCommandTrigger, "将下一条图片保存到本群（需使用 ! 前缀）")
     .action(async ({ session }) => {
       if (!session!.guildId) return "此指令仅限群聊使用";
       if (!session!.userId) return "无法获取用户信息";
 
       // 仅允许“引用含图消息”进行存图，不再支持发送指令后等待下一条图片。
-      const imgUrl = extractImageFromQuote(session);
+      const imgUrl = await extractImageFromQuote(session);
       const scopeKey = getScopeKey(session!.guildId, session!.userId);
       if (!imgUrl) {
+        logger.debug(
+          `[存图] 未从引用中提取到图片，content=${session?.content ?? ""} ` +
+          `quoteId=${session?.quote?.id ?? session?.quote?.messageId ?? "none"}`,
+        );
         return `请使用“引用含图消息 + ${saveCommandTrigger}”进行保存`;
       }
 
@@ -346,9 +607,10 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 存图失败：${err?.message ?? "未知错误"}`;
       }
     });
+  for (const alias of saveCommandTriggers.slice(1)) saveCommand.alias(alias);
 
   // ── 指令：更图 ───────────────────────────────────────────────────────────────
-  ctx
+  const getCommand = ctx
     .command(getCommandTrigger, "发出本群已保存的图片（需使用 ! 前缀）")
     .action(async ({ session }) => {
       if (!session!.guildId) return "此指令仅限群聊使用";
@@ -389,9 +651,10 @@ export function apply(ctx: Context, config: Config) {
         return `❌ 更图失败：${err?.message ?? "未知错误"}`;
       }
     });
+  for (const alias of getCommandTriggers.slice(1)) getCommand.alias(alias);
 
   // ── 指令：存图模式（管理员）──────────────────────────────────────────────────
-  ctx
+  const modeCommand = ctx
     .command(`${modeCommandTrigger} [mode:string]`, "管理员切换当前群存图模式（共享/个人，需使用 ! 前缀）")
     .action(async ({ session }, modeText) => {
       if (!session?.guildId) return "此指令仅限群聊使用";
@@ -413,4 +676,5 @@ export function apply(ctx: Context, config: Config) {
       }
       return `✅ 已切换为${getModeLabel(normalizedMode)}`;
     });
+  for (const alias of modeCommandTriggers.slice(1)) modeCommand.alias(alias);
 }

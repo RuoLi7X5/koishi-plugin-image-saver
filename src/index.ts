@@ -203,6 +203,18 @@ export function apply(ctx: Context, config: Config) {
     return mode === "user" ? "群内个人模式" : "群共享模式";
   }
 
+  function normalizeCommandName(input: string, fallback: string): string {
+    const normalized = (input ?? "").trim().replace(/^[!！\s]+/, "");
+    return normalized || fallback;
+  }
+
+  const saveCommandName = normalizeCommandName(config.saveCommand, "存图");
+  const getCommandName = normalizeCommandName(config.getCommand, "更图");
+  const modeCommandName = normalizeCommandName(config.modeCommand, "存图模式");
+  const saveCommandTrigger = `!${saveCommandName}`;
+  const getCommandTrigger = `!${getCommandName}`;
+  const modeCommandTrigger = `!${modeCommandName}`;
+
   function canUseModeCommand(session: any): boolean {
     const userId = session?.userId;
     if (!userId) return false;
@@ -267,15 +279,15 @@ export function apply(ctx: Context, config: Config) {
 
   // 兼容中文/英文感叹号命令前缀：将开头全角 ！ 归一化为半角 !
   ctx.middleware(async (session, next) => {
-    if (session.content?.startsWith("！")) {
-      session.content = `!${session.content.slice(1)}`;
+    if (session.content?.includes("！")) {
+      session.content = session.content.replace(/！/g, "!");
     }
     return next();
   }, true);
 
   // ── 指令：存图 ───────────────────────────────────────────────────────────────
   ctx
-    .command(config.saveCommand, "将下一条图片保存到本群（指令名可在配置中修改）")
+    .command(saveCommandTrigger, "将下一条图片保存到本群（需使用 ! 前缀）")
     .action(async ({ session }) => {
       if (!session!.guildId) return "此指令仅限群聊使用";
       if (!session!.userId) return "无法获取用户信息";
@@ -284,7 +296,7 @@ export function apply(ctx: Context, config: Config) {
       const imgUrl = extractImageFromQuote(session);
       const scopeKey = getScopeKey(session!.guildId, session!.userId);
       if (!imgUrl) {
-        return "请使用“引用含图消息 + 存图”进行保存";
+        return `请使用“引用含图消息 + ${saveCommandTrigger}”进行保存`;
       }
 
       try {
@@ -298,7 +310,7 @@ export function apply(ctx: Context, config: Config) {
 
   // ── 指令：更图 ───────────────────────────────────────────────────────────────
   ctx
-    .command(config.getCommand, "发出本群已保存的图片（指令名可在配置中修改）")
+    .command(getCommandTrigger, "发出本群已保存的图片（需使用 ! 前缀）")
     .action(async ({ session }) => {
       if (!session!.guildId) return "此指令仅限群聊使用";
       if (!session!.userId) return "无法获取用户信息";
@@ -341,7 +353,7 @@ export function apply(ctx: Context, config: Config) {
 
   // ── 指令：存图模式（管理员）──────────────────────────────────────────────────
   ctx
-    .command(`${config.modeCommand} [mode:string]`, "管理员切换当前群存图模式（共享/个人）")
+    .command(`${modeCommandTrigger} [mode:string]`, "管理员切换当前群存图模式（共享/个人，需使用 ! 前缀）")
     .action(async ({ session }, modeText) => {
       if (!session?.guildId) return "此指令仅限群聊使用";
       if (!canUseModeCommand(session)) return;
@@ -350,7 +362,7 @@ export function apply(ctx: Context, config: Config) {
       const normalizedMode = normalizeMode(modeText);
       if (!normalizedMode) {
         const current = resolveBindMode(guildId);
-        return `当前模式：${getModeLabel(current)}\n用法：${config.modeCommand} 共享 或 ${config.modeCommand} 个人`;
+        return `当前模式：${getModeLabel(current)}\n用法：${modeCommandTrigger} 共享 或 ${modeCommandTrigger} 个人`;
       }
 
       runtimeModeMap.set(guildId, normalizedMode);

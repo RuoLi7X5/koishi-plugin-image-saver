@@ -208,6 +208,10 @@ export function apply(ctx: Context, config: Config) {
     return normalized || fallback;
   }
 
+  function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
   const saveCommandName = normalizeCommandName(config.saveCommand, "存图");
   const getCommandName = normalizeCommandName(config.getCommand, "更图");
   const modeCommandName = normalizeCommandName(config.modeCommand, "存图模式");
@@ -272,15 +276,50 @@ export function apply(ctx: Context, config: Config) {
     return typeof url === "string" && url ? url : null;
   }
 
-  /** 仅允许从引用消息提取图片 URL。 */
+  /**
+   * 仅允许从引用消息提取图片 URL。
+   * 同时兼容两种结构：
+   * 1) session.quote.elements
+   * 2) session.elements 里的 <quote> 子树
+   */
   function extractImageFromQuote(session: any): string | null {
-    return extractFirstImageUrl(session?.quote?.elements ?? []);
+    const quoteElements = session?.quote?.elements ?? [];
+    const fromQuoteField = extractFirstImageUrl(quoteElements);
+    if (fromQuoteField) return fromQuoteField;
+
+    const quoteNodes = h.select(session?.elements ?? [], "quote");
+    for (const node of quoteNodes) {
+      const fromQuoteNode = extractFirstImageUrl((node as any)?.children ?? []);
+      if (fromQuoteNode) return fromQuoteNode;
+    }
+    return null;
   }
 
-  // 兼容中文/英文感叹号命令前缀：将开头全角 ！ 归一化为半角 !
+  // 兼容中文/英文感叹号命令前缀：将常见全角/变体叹号归一化为半角 !
   ctx.middleware(async (session, next) => {
-    if (session.content?.includes("！")) {
-      session.content = session.content.replace(/！/g, "!");
+    if (session.content) {
+      // 兼容：！(FF01)、﹗(FE57)、︕(FE15)
+      session.content = session.content.replace(/[\uFF01\uFE57\uFE15]/g, "!");
+    }
+    // 兼容引用消息时自动携带的 @前缀（如 @某人!存图 / [CQ:at]!存图 / <at/>!存图）
+    if (session.content?.includes("!")) {
+      session.content = session.content
+        .replace(/^(?:<quote\b[^>]*\/>\s*)+/i, "")
+        .replace(/^(?:<at\b[^>]*\/>\s*)+/i, "")
+        .replace(/^(?:\[CQ:(?:reply|at),[^\]]+\]\s*)+/i, "")
+        .replace(/^(?:@\S+\s*)+/, "");
+    }
+    // 兼容 "! 存图"、"@bot! 存图" 这类写法，统一归一为 "!存图"
+    if (session.content?.includes("!")) {
+      const names = [modeCommandName, saveCommandName, getCommandName]
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+      let normalized = session.content;
+      for (const name of names) {
+        const pattern = new RegExp(`!\\s*(${escapeRegExp(name)})(?=\\s|$)`, "g");
+        normalized = normalized.replace(pattern, `!$1`);
+      }
+      session.content = normalized;
     }
     return next();
   }, true);

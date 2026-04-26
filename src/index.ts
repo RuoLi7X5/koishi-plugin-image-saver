@@ -367,6 +367,65 @@ export function apply(ctx: Context, config: Config) {
     return null;
   }
 
+  function extractQuotedMessageImage(input: any, depth = 0, seen = new WeakSet<object>()): string | null {
+    if (input == null || depth > 6) return null;
+
+    if (typeof input === "string") {
+      return extractImageFromContentString(input);
+    }
+
+    if (Array.isArray(input)) {
+      for (const item of input) {
+        const found = extractQuotedMessageImage(item, depth + 1, seen);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    if (typeof input !== "object") return null;
+    if (seen.has(input)) return null;
+    seen.add(input);
+
+    const obj = input as Record<string, any>;
+
+    // 明确跳过头像/资料类字段，避免误存用户头像
+    for (const blocked of ["avatar", "face", "head", "icon", "portrait"]) {
+      if (blocked in obj) {
+        // do nothing; just avoid using these fields as image sources
+      }
+    }
+
+    // 优先只看消息正文相关字段
+    for (const key of ["elements", "content", "message", "children", "data"]) {
+      if (!(key in obj)) continue;
+      const value = obj[key];
+      if (key === "elements" && Array.isArray(value)) {
+        const fromElements = extractFirstImageUrl(value as h[]);
+        if (fromElements) return fromElements;
+      }
+      const found = extractQuotedMessageImage(value, depth + 1, seen);
+      if (found) return found;
+    }
+
+    // 对标准图片节点再做一次有限扫描
+    const type = typeof obj.type === "string" ? obj.type.toLowerCase() : "";
+    if (type === "img" || type === "image") {
+      for (const key of ["src", "url", "file"]) {
+        const value = obj[key];
+        if (typeof value === "string" && value) return value;
+      }
+      const attrs = obj.attrs as Record<string, any> | undefined;
+      if (attrs) {
+        for (const key of ["src", "url", "file"]) {
+          const value = attrs[key];
+          if (typeof value === "string" && value) return value;
+        }
+      }
+    }
+
+    return null;
+  }
+
   function extractReplyIdFromUnknown(input: any, depth = 0, seen = new WeakSet<object>()): string | null {
     if (input == null || depth > 6) return null;
 
@@ -457,67 +516,10 @@ export function apply(ctx: Context, config: Config) {
   async function extractImageFromQuote(session: any): Promise<string | null> {
     const diagnostics: string[] = [];
 
-    // 最高优先级：直接扫描整条消息元素树。
-    // 很多适配器会把“引用图片预览”直接展开进当前消息 elements，
-    // 但不一定同步填充 session.quote。
-    const fromSessionElements = extractFirstImageUrl(session?.elements ?? []);
-    if (fromSessionElements) return fromSessionElements;
-    diagnostics.push(`session.elements(img/image)=miss:${summarizeValue(session?.elements)}`);
-
-    const fromSessionUnknown = extractImageFromUnknown(session?.elements ?? []);
-    if (fromSessionUnknown) return fromSessionUnknown;
-    diagnostics.push("session.elements(recursive)=miss");
-
-    const quoteElements = session?.quote?.elements ?? [];
-    const fromQuoteField = extractFirstImageUrl(quoteElements);
-    if (fromQuoteField) return fromQuoteField;
-    diagnostics.push(`session.quote.elements=miss:${summarizeValue(quoteElements)}`);
-
-    const fromQuoteUnknown = extractImageFromUnknown(session?.quote);
-    if (fromQuoteUnknown) return fromQuoteUnknown;
-    diagnostics.push(`session.quote(recursive)=miss:${summarizeValue(session?.quote)}`);
-
-    const fromEventReply = extractImageFromUnknown(session?.event?.reply);
-    if (fromEventReply) return fromEventReply;
-    diagnostics.push(`session.event.reply=miss:${summarizeValue(session?.event?.reply)}`);
-
-    const fromEventQuote = extractImageFromUnknown(session?.event?.quote);
-    if (fromEventQuote) return fromEventQuote;
-    diagnostics.push(`session.event.quote=miss:${summarizeValue(session?.event?.quote)}`);
-
-    const fromEventMessage = extractImageFromUnknown(session?.event?.message);
-    if (fromEventMessage) return fromEventMessage;
-    diagnostics.push(`session.event.message=miss:${summarizeValue(session?.event?.message)}`);
-
-    const fromEventRawMessage = extractImageFromUnknown(session?.event?._data ?? session?.event?.raw);
-    if (fromEventRawMessage) return fromEventRawMessage;
-    diagnostics.push(`session.event.raw=miss:${summarizeValue(session?.event?._data ?? session?.event?.raw)}`);
-
-    const fromQuoteMessage = extractImageFromUnknown(session?.quote?.message);
-    if (fromQuoteMessage) return fromQuoteMessage;
-    diagnostics.push(`session.quote.message=miss:${summarizeValue(session?.quote?.message)}`);
-
-    const quoteNodes = h.select(session?.elements ?? [], "quote");
-    for (const node of quoteNodes) {
-      const fromQuoteNode = extractFirstImageUrl((node as any)?.children ?? []);
-      if (fromQuoteNode) return fromQuoteNode;
-      const fromQuoteNodeUnknown = extractImageFromUnknown(node);
-      if (fromQuoteNodeUnknown) return fromQuoteNodeUnknown;
-      const fromQuoteAttrs = extractImageFromUnknown((node as any)?.attrs);
-      if (fromQuoteAttrs) return fromQuoteAttrs;
-    }
-    diagnostics.push(`quoteNodes=miss:count=${quoteNodes.length}`);
-
-    const fromQuoteContent = extractImageFromContentString(session?.quote?.content);
-    if (fromQuoteContent) return fromQuoteContent;
-    diagnostics.push(`session.quote.content=miss:${summarizeValue(session?.quote?.content)}`);
-
     const rawContent = session?.__imageSaverRawContent ?? session?.content;
-    const fromRawContent = extractImageFromContentString(rawContent);
-    if (fromRawContent) return fromRawContent;
-    diagnostics.push(`rawContent=miss:${summarizeValue(rawContent)}`);
+    diagnostics.push(`rawContent=${summarizeValue(rawContent)}`);
 
-    // 兜底：按引用消息 ID 回查原消息（部分适配器不会在 quote 中附带元素树）
+    // 只认“被引用原消息”中的图片，不再从当前命令消息或事件整体宽泛扫图。
     const quoteId =
       session?.quote?.id ??
       session?.quote?.messageId ??
@@ -525,10 +527,10 @@ export function apply(ctx: Context, config: Config) {
       extractReplyIdFromUnknown(session?.event?.quote) ??
       extractReplyIdFromUnknown(session?.event?._data ?? session?.event?.raw) ??
       extractReplyIdFromContent(session?.event?._data?.raw_message ?? session?.event?.raw?.raw_message) ??
-      extractReplyIdFromUnknown(quoteNodes) ??
       extractReplyIdFromContent(rawContent) ??
       extractReplyIdFromContent(session?.content);
     diagnostics.push(`quoteId=${quoteId ?? "none"}`);
+
     const channelId = session?.channelId;
     const getMessage = session?.bot?.getMessage;
     if (quoteId && channelId && typeof getMessage === "function") {
@@ -541,12 +543,8 @@ export function apply(ctx: Context, config: Config) {
       for (const item of tryFetches) {
         try {
           const quoted = await item.run();
-          const fromQuotedElements = extractFirstImageUrl(quoted?.elements ?? []);
-          if (fromQuotedElements) return fromQuotedElements;
-          const fromQuotedContent = extractImageFromContentString(quoted?.content);
-          if (fromQuotedContent) return fromQuotedContent;
-          const fromQuotedUnknown = extractImageFromUnknown(quoted);
-          if (fromQuotedUnknown) return fromQuotedUnknown;
+          const fromQuoted = extractQuotedMessageImage(quoted);
+          if (fromQuoted) return fromQuoted;
           diagnostics.push(`${item.label}=miss:${summarizeValue(quoted)}`);
         } catch (err: any) {
           diagnostics.push(`${item.label}=error:${err?.message ?? err}`);

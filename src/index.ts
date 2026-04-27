@@ -96,6 +96,14 @@ async function downloadImage(url: string, depth = 0): Promise<{ buf: Buffer; ext
     return { buf, ext: detectExt(buf, "") };
   }
 
+  // 兼容适配器直接给出本地绝对路径（如 /root/... 或 C:\...\）
+  // 但排除类似 /download?appid=... 这类“URL 查询”，避免误当成文件路径读取
+  if ((url.startsWith("/") && !url.includes("?")) || /^[a-zA-Z]:[\\/]/.test(url)) {
+    const fsp = require("fs").promises as typeof import("fs").promises;
+    const buf = await fsp.readFile(url);
+    return { buf, ext: detectExt(buf, "") };
+  }
+
   // ── http / https ──────────────────────────────────────────────────────────
   return new Promise((resolve, reject) => {
     const lib: typeof import("https") = url.startsWith("https")
@@ -426,6 +434,101 @@ export function apply(ctx: Context, config: Config) {
     return null;
   }
 
+  function isLikelyAvatarLike(value: string): boolean {
+    const text = value.toLowerCase();
+    return (
+      text.includes("qlogo.cn") ||
+      text.includes("/avatar") ||
+      text.includes("avatar") ||
+      text.includes("portrait") ||
+      text.includes("/head/") ||
+      text.includes("/headimg")
+    );
+  }
+
+  function extractStrictMessageImage(elements: any[]): string | null {
+    const nodes = [
+      ...h.select(elements as h[], "img"),
+      ...h.select(elements as h[], "image"),
+    ];
+    for (const node of nodes) {
+      const attrs: any = (node as any)?.attrs ?? {};
+      const candidates = [attrs.src, attrs.url, attrs.file];
+      for (const value of candidates) {
+        if (typeof value !== "string" || !value) continue;
+        if (isLikelyAvatarLike(value)) continue;
+        return value;
+      }
+    }
+    return null;
+  }
+
+  function extractStrictQuotedImageFromMessageObject(message: any): string | null {
+    if (!message || typeof message !== "object") return null;
+
+    // onebot 风格：raw_message 通常直接包含 [CQ:image,...]，比 h.parse 更稳定
+    const rawCandidates: Array<string | undefined> = [
+      message.raw_message,
+      message.raw,
+      message.content,
+      message.text,
+      typeof message.message === "string" ? message.message : undefined,
+      message?.data?.raw_message,
+      message?.data?.raw,
+      message?.data?.content,
+    ];
+    for (const cand of rawCandidates) {
+      const found = extractImageFromContentString(cand);
+      if (found) {
+        if (isLikelyAvatarLike(found)) continue;
+        return found;
+      }
+    }
+
+    const directElements = message?.elements;
+    if (Array.isArray(directElements)) {
+      const found = extractStrictMessageImage(directElements);
+      if (found) return found;
+    }
+
+    const directContent = typeof message?.content === "string" ? message.content : "";
+    if (directContent) {
+      try {
+        const parsed = h.parse(directContent);
+        const found = extractStrictMessageImage(parsed);
+        if (found) return found;
+      } catch {}
+    }
+
+    // 常见 onebot 返回体里 message 字段可能就是正文消息段数组
+    if (Array.isArray(message?.message)) {
+      const found = extractStrictMessageImage(message.message);
+      if (found) return found;
+    }
+
+    // 少数实现会把正文挂在 data.message / data.elements
+    const data = message?.data;
+    if (data && typeof data === "object") {
+      if (Array.isArray(data.elements)) {
+        const found = extractStrictMessageImage(data.elements);
+        if (found) return found;
+      }
+      if (Array.isArray(data.message)) {
+        const found = extractStrictMessageImage(data.message);
+        if (found) return found;
+      }
+      if (typeof data.content === "string") {
+        try {
+          const parsed = h.parse(data.content);
+          const found = extractStrictMessageImage(parsed);
+          if (found) return found;
+        } catch {}
+      }
+    }
+
+    return null;
+  }
+
   function extractReplyIdFromUnknown(input: any, depth = 0, seen = new WeakSet<object>()): string | null {
     if (input == null || depth > 6) return null;
 
@@ -507,6 +610,62 @@ export function apply(ctx: Context, config: Config) {
     return null;
   }
 
+  function extractSourceMsgIdInRecords(eventData: any): string | null {
+    const seen = new WeakSet<object>();
+    const walk = (node: any, depth: number): string | null => {
+      if (node == null || depth > 10) return null;
+      if (typeof node !== "object") return null;
+      if (seen.has(node)) return null;
+      seen.add(node);
+      const obj = node as Record<string, any>;
+      const v = obj.sourceMsgIdInRecords;
+      if (typeof v === "string" || typeof v === "number") return String(v);
+      for (const value of Object.values(obj)) {
+        const found = walk(value, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(eventData, 0);
+  }
+
+  function extractPicElementSourcePath(eventData: any, targetMsgId?: string | null): string | null {
+    const seen = new WeakSet<object>();
+    const walk = (node: any, depth: number): string | null => {
+      if (node == null || depth > 10) return null;
+      if (typeof node !== "object") return null;
+      if (seen.has(node)) return null;
+      seen.add(node);
+      const obj = node as Record<string, any>;
+
+      // 优先：如果当前对象是“某条消息”，且 msgId 命中目标，则在 elements 里找 picElement.sourcePath
+      const msgId = obj.msgId ?? obj.msg_id ?? obj.id;
+      if (targetMsgId && msgId != null && String(msgId) === targetMsgId) {
+        const elements = obj.elements;
+        if (Array.isArray(elements)) {
+          for (const el of elements) {
+            const sp = (el as any)?.picElement?.sourcePath;
+            if (typeof sp === "string" && sp) return sp;
+          }
+        }
+      }
+
+      // 如果没有提供目标 msgId，再尝试直接提取 picElement.sourcePath
+      // 但一旦提供了目标 msgId，就严格只从“该消息对象”里取，避免误存头像/预览资源。
+      if (!targetMsgId) {
+        const directSp = obj.picElement?.sourcePath;
+        if (typeof directSp === "string" && directSp) return directSp;
+      }
+
+      for (const value of Object.values(obj)) {
+        const found = walk(value, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(eventData, 0);
+  }
+
   /**
    * 仅允许从引用消息提取图片 URL。
    * 同时兼容两种结构：
@@ -520,30 +679,59 @@ export function apply(ctx: Context, config: Config) {
     diagnostics.push(`rawContent=${summarizeValue(rawContent)}`);
 
     // 只认“被引用原消息”中的图片，不再从当前命令消息或事件整体宽泛扫图。
-    const quoteId =
-      session?.quote?.id ??
-      session?.quote?.messageId ??
-      extractReplyIdFromUnknown(session?.event?.reply) ??
-      extractReplyIdFromUnknown(session?.event?.quote) ??
-      extractReplyIdFromUnknown(session?.event?._data ?? session?.event?.raw) ??
-      extractReplyIdFromContent(session?.event?._data?.raw_message ?? session?.event?.raw?.raw_message) ??
-      extractReplyIdFromContent(rawContent) ??
-      extractReplyIdFromContent(session?.content);
-    diagnostics.push(`quoteId=${quoteId ?? "none"}`);
+    const toIdString = (value: any): string | null =>
+      (typeof value === "string" || typeof value === "number") ? String(value) : null;
+
+    const currentMessageId =
+      toIdString(session?.event?._data?.message_id) ??
+      toIdString(session?.event?._data?.messageId) ??
+      toIdString(session?.event?.message_id) ??
+      toIdString(session?.event?.messageId) ??
+      toIdString(session?.event?.id) ??
+      toIdString(session?.event?._data?.id);
+
+    const eventRawMessage =
+      session?.event?._data?.raw_message ??
+      session?.event?.raw?.raw_message ??
+      session?.event?.raw_message;
+
+    const replyIdFromRawMessage = extractReplyIdFromContent(eventRawMessage);
+
+    // 没有明确的引用标识时，不允许回查 getMessage（避免空发指令触发 get_msg）。
+    if (!replyIdFromRawMessage) {
+      diagnostics.push("reply evidence missing(no CQ:reply). skip getMessage");
+      logger.warn(`[存图] 抓图失败。原因链路：${diagnostics.join(" | ")}`);
+      return null;
+    }
+
+    const quoteId = replyIdFromRawMessage;
+    if (currentMessageId && quoteId === currentMessageId) {
+      diagnostics.push("reply id equals current message id. skip");
+      logger.warn(`[存图] 抓图失败。原因链路：${diagnostics.join(" | ")}`);
+      return null;
+    }
+    diagnostics.push(`quoteId=${quoteId}`);
 
     const channelId = session?.channelId;
     const getMessage = session?.bot?.getMessage;
-    if (quoteId && channelId && typeof getMessage === "function") {
+    if (typeof getMessage === "function") {
       const tryFetches: Array<{ label: string; run: () => Promise<any> }> = [
-        { label: "getMessage(channelId, quoteId)", run: () => getMessage.call(session.bot, channelId, quoteId) },
-        { label: "getMessage(channelId, quoteId, guildId)", run: () => getMessage.call(session.bot, channelId, quoteId, session?.guildId) },
-        { label: "getMessage(quoteId, channelId)", run: () => getMessage.call(session.bot, quoteId, channelId) },
-        { label: "getMessage(quoteId, channelId, guildId)", run: () => getMessage.call(session.bot, quoteId, channelId, session?.guildId) },
+        // 尽量用最直接的“消息 id”回查
+        { label: "getMessage(quoteId)", run: () => getMessage.call(session.bot, quoteId) },
       ];
+      if (channelId) {
+        tryFetches.push(
+          { label: "getMessage(channelId, quoteId)", run: () => getMessage.call(session.bot, channelId, quoteId) },
+          { label: "getMessage(channelId, quoteId, guildId)", run: () => getMessage.call(session.bot, channelId, quoteId, session?.guildId) },
+          { label: "getMessage(quoteId, channelId)", run: () => getMessage.call(session.bot, quoteId, channelId) },
+          { label: "getMessage(quoteId, channelId, guildId)", run: () => getMessage.call(session.bot, quoteId, channelId, session?.guildId) },
+        );
+      }
+
       for (const item of tryFetches) {
         try {
           const quoted = await item.run();
-          const fromQuoted = extractQuotedMessageImage(quoted);
+          const fromQuoted = extractStrictQuotedImageFromMessageObject(quoted);
           if (fromQuoted) return fromQuoted;
           diagnostics.push(`${item.label}=miss:${summarizeValue(quoted)}`);
         } catch (err: any) {
@@ -553,6 +741,19 @@ export function apply(ctx: Context, config: Config) {
     } else {
       diagnostics.push(`getMessage unavailable=${typeof getMessage !== "function"} channelId=${channelId ?? "none"}`);
     }
+
+    // 回查失败/引用链断裂（比如 replayMsgId=0）时，直接从事件数据里找源图片 picElement.sourcePath
+    const eventData = session?.event?._data ?? session?.event?.raw ?? session?.event;
+    const sourceMsgIdInRecords = extractSourceMsgIdInRecords(eventData);
+    // 只有拿到目标 msgId 才允许从事件中提取 picElement.sourcePath
+    // 否则（msgId 缺失）会退化为全局扫图，可能误存非目标资源（例如缩略图/预览）。
+    const fallbackSourcePath = sourceMsgIdInRecords
+      ? extractPicElementSourcePath(eventData, sourceMsgIdInRecords)
+      : null;
+    diagnostics.push(
+      `fallbackSourcePath=${fallbackSourcePath ? "found" : "none"} targetMsgId=${sourceMsgIdInRecords ?? "none"}`,
+    );
+    if (fallbackSourcePath) return fallbackSourcePath;
 
     logger.warn(
       `[存图] 抓图失败。原因链路：${diagnostics.join(" | ")}`,
@@ -614,6 +815,21 @@ export function apply(ctx: Context, config: Config) {
         return "✅ 存图成功！";
       } catch (err: any) {
         logger.error("存图失败：", err);
+        // 若下载失败/链接不可达，尝试从事件记录直接取本地 picElement.sourcePath 作为兜底
+        try {
+          const ev = (session as any)?.event;
+          const eventData = ev?._data ?? ev?.raw ?? ev;
+          const sourceMsgIdInRecords = extractSourceMsgIdInRecords(eventData);
+          if (sourceMsgIdInRecords) {
+            const fallbackSourcePath = extractPicElementSourcePath(eventData, sourceMsgIdInRecords);
+            if (fallbackSourcePath && fallbackSourcePath !== imgUrl) {
+              await saveImageForScope(scopeKey, fallbackSourcePath);
+              return "✅ 存图成功！";
+            }
+          }
+        } catch (err2: any) {
+          logger.error("存图回退失败：", err2);
+        }
         return `❌ 存图失败：${err?.message ?? "未知错误"}`;
       }
     });

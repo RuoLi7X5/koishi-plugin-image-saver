@@ -74,10 +74,35 @@ function detectExt(buf: Buffer, contentType: string): string {
   return "png";
 }
 
+function buildRelativeDownloadCandidates(relativeUrl: string, base: string): string[] {
+  const set = new Set<string>();
+  const push = (value: string) => {
+    try {
+      set.add(new URL(value).toString());
+    } catch {}
+  };
+
+  try {
+    push(new URL(relativeUrl, base).toString());
+  } catch {}
+
+  try {
+    const parsedBase = new URL(base);
+    push(new URL(relativeUrl, parsedBase.origin).toString());
+    const basePath = parsedBase.pathname.replace(/\/+$/, "");
+    if (basePath && basePath !== "/") {
+      const noLeadingRelative = relativeUrl.replace(/^\/+/, "");
+      push(new URL(`${basePath}/${noLeadingRelative}`, parsedBase.origin).toString());
+    }
+  } catch {}
+
+  return [...set];
+}
+
 /**
  * 下载/解码图片，支持 http/https、data URI（base64）、file:// 三种来源
  */
-async function downloadImage(url: string, depth = 0): Promise<{ buf: Buffer; ext: string }> {
+async function downloadImage(url: string, depth = 0, relativeUrlBases: string[] = []): Promise<{ buf: Buffer; ext: string }> {
   if (depth > 3) throw new Error("重定向次数过多");
 
   // ── data URI（base64 编码）────────────────────────────────────────────────
@@ -94,6 +119,25 @@ async function downloadImage(url: string, depth = 0): Promise<{ buf: Buffer; ext
     const fsp = require("fs").promises as typeof import("fs").promises;
     const buf = await fsp.readFile(fileURLToPath(url));
     return { buf, ext: detectExt(buf, "") };
+  }
+
+  // 兼容相对下载链接（如 /download?appid=...）：尝试使用已知基址补全为绝对 URL
+  if (url.startsWith("/") && url.includes("?")) {
+    let lastError: any = null;
+    for (const base of relativeUrlBases) {
+      const absoluteCandidates = buildRelativeDownloadCandidates(url, base);
+      for (const absoluteUrl of absoluteCandidates) {
+        try {
+          return await downloadImage(absoluteUrl, depth + 1, relativeUrlBases);
+        } catch (err: any) {
+          lastError = err;
+        }
+      }
+    }
+    if (relativeUrlBases.length === 0) {
+      throw new Error(`相对图片地址无法下载：${url}（缺少可用下载基址）`);
+    }
+    throw new Error(`相对图片地址无法下载：${url}（已尝试 ${relativeUrlBases.length} 个基址，最后错误：${lastError?.message ?? lastError}）`);
   }
 
   // 兼容适配器直接给出本地绝对路径（如 /root/... 或 C:\...\）
@@ -121,7 +165,7 @@ async function downloadImage(url: string, depth = 0): Promise<{ buf: Buffer; ext
 
         if (statusCode >= 300 && statusCode < 400 && headers.location) {
           res.resume();
-          downloadImage(headers.location as string, depth + 1).then(resolve).catch(reject);
+          downloadImage(headers.location as string, depth + 1, relativeUrlBases).then(resolve).catch(reject);
           return;
         }
 
@@ -239,10 +283,69 @@ export function apply(ctx: Context, config: Config) {
   const getCommandTrigger = getCommandTriggers[0];
   const modeCommandTrigger = modeCommandTriggers[0];
 
+  function readAuthority(value: any): number | null {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  }
+
+  function isSuperAdminSession(session: any): boolean {
+    const authority =
+      readAuthority(session?.user?.authority) ??
+      readAuthority((session as any)?.authority) ??
+      readAuthority(session?.author?.authority);
+    return authority != null && authority >= 4;
+  }
+
   function canUseModeCommand(session: any): boolean {
+    if (isSuperAdminSession(session)) return true;
     const userId = session?.userId;
     if (!userId) return false;
     return modeAdminSet.has(String(userId));
+  }
+
+  function normalizeHttpBase(value: any): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const normalized = trimmed
+      .replace(/^ws:\/\//i, "http://")
+      .replace(/^wss:\/\//i, "https://");
+    if (!/^https?:\/\//i.test(normalized)) return null;
+    try {
+      return new URL(normalized).toString();
+    } catch {
+      return null;
+    }
+  }
+
+  function collectRelativeUrlBases(session: any): string[] {
+    const envBasesRaw = (process.env.IMAGE_SAVER_RELATIVE_URL_BASES ?? process.env.IMAGE_SAVER_RELATIVE_URL_BASE ?? "")
+      .split(/[,\s]+/)
+      .filter(Boolean);
+    const candidateValues: any[] = [
+      ...envBasesRaw,
+      (session as any)?.bot?.config?.endpoint,
+      (session as any)?.bot?.config?.baseUrl,
+      (session as any)?.bot?.config?.selfUrl,
+      (session as any)?.bot?.selfUrl,
+      (session as any)?.bot?.internal?.config?.endpoint,
+      (session as any)?.bot?.internal?._config?.endpoint,
+      (session as any)?.event?._data?.self?.url,
+      (session as any)?.event?.raw?.self?.url,
+    ];
+    const seen = new Set<string>();
+    const bases: string[] = [];
+    for (const value of candidateValues) {
+      const base = normalizeHttpBase(value);
+      if (!base || seen.has(base)) continue;
+      seen.add(base);
+      bases.push(base);
+    }
+    return bases;
   }
 
   loadRuntimeModeOverrides();
@@ -258,9 +361,10 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /** 下载图片并保存（覆盖该作用域旧图） */
-  async function saveImageForScope(scopeKey: string, url: string): Promise<void> {
+  async function saveImageForScope(scopeKey: string, url: string, session?: any): Promise<void> {
     const fsp = require("fs").promises as typeof import("fs").promises;
-    const { buf, ext } = await downloadImage(url);
+    const relativeUrlBases = collectRelativeUrlBases(session);
+    const { buf, ext } = await downloadImage(url, 0, relativeUrlBases);
     const dir = getStorageDir();
     const base = join(dir, safeScopeKey(scopeKey));
 
@@ -314,123 +418,18 @@ export function apply(ctx: Context, config: Config) {
 
     // onebot 常见格式：[CQ:image,file=...,url=...]
     const urlMatch = content.match(/\[CQ:image,[^\]]*url=([^,\]]+)[^\]]*\]/i);
-    if (urlMatch?.[1]) return decodeURIComponent(urlMatch[1]);
     const fileMatch = content.match(/\[CQ:image,[^\]]*file=([^,\]]+)[^\]]*\]/i);
-    if (fileMatch?.[1]) return decodeURIComponent(fileMatch[1]);
-    return null;
-  }
-
-  function isImageLikeUrl(value: string): boolean {
-    if (!value) return false;
-    return /^(https?:\/\/|file:\/\/|data:image\/)/i.test(value);
-  }
-
-  function extractImageFromUnknown(input: any, depth = 0, seen = new WeakSet<object>()): string | null {
-    if (input == null || depth > 6) return null;
-
-    if (typeof input === "string") {
-      const fromContent = extractImageFromContentString(input);
-      if (fromContent) return fromContent;
-      return isImageLikeUrl(input) ? input : null;
+    const decodedFile = fileMatch?.[1] ? decodeURIComponent(fileMatch[1]) : null;
+    if (decodedFile && (
+      /^https?:\/\//i.test(decodedFile) ||
+      /^file:\/\//i.test(decodedFile) ||
+      /^[a-zA-Z]:[\\/]/.test(decodedFile) ||
+      decodedFile.startsWith("/")
+    )) {
+      return decodedFile;
     }
-
-    if (Array.isArray(input)) {
-      for (const item of input) {
-        const found = extractImageFromUnknown(item, depth + 1, seen);
-        if (found) return found;
-      }
-      return null;
-    }
-
-    if (typeof input !== "object") return null;
-    if (seen.has(input)) return null;
-    seen.add(input);
-
-    const obj = input as Record<string, any>;
-
-    // 优先扫描常见图片字段
-    for (const key of ["src", "url", "file", "path", "downloadUrl", "resourceUrl"]) {
-      const value = obj[key];
-      if (typeof value === "string") {
-        const found = extractImageFromUnknown(value, depth + 1, seen);
-        if (found) return found;
-      }
-    }
-
-    // 常见消息结构字段
-    for (const key of ["attrs", "children", "elements", "quote", "content", "message", "data"]) {
-      if (key in obj) {
-        const found = extractImageFromUnknown(obj[key], depth + 1, seen);
-        if (found) return found;
-      }
-    }
-
-    for (const [key, value] of Object.entries(obj)) {
-      if (["src", "url", "file", "path", "downloadUrl", "resourceUrl", "attrs", "children", "elements", "quote", "content", "message", "data"].includes(key)) {
-        continue;
-      }
-      const found = extractImageFromUnknown(value, depth + 1, seen);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  function extractQuotedMessageImage(input: any, depth = 0, seen = new WeakSet<object>()): string | null {
-    if (input == null || depth > 6) return null;
-
-    if (typeof input === "string") {
-      return extractImageFromContentString(input);
-    }
-
-    if (Array.isArray(input)) {
-      for (const item of input) {
-        const found = extractQuotedMessageImage(item, depth + 1, seen);
-        if (found) return found;
-      }
-      return null;
-    }
-
-    if (typeof input !== "object") return null;
-    if (seen.has(input)) return null;
-    seen.add(input);
-
-    const obj = input as Record<string, any>;
-
-    // 明确跳过头像/资料类字段，避免误存用户头像
-    for (const blocked of ["avatar", "face", "head", "icon", "portrait"]) {
-      if (blocked in obj) {
-        // do nothing; just avoid using these fields as image sources
-      }
-    }
-
-    // 优先只看消息正文相关字段
-    for (const key of ["elements", "content", "message", "children", "data"]) {
-      if (!(key in obj)) continue;
-      const value = obj[key];
-      if (key === "elements" && Array.isArray(value)) {
-        const fromElements = extractFirstImageUrl(value as h[]);
-        if (fromElements) return fromElements;
-      }
-      const found = extractQuotedMessageImage(value, depth + 1, seen);
-      if (found) return found;
-    }
-
-    // 对标准图片节点再做一次有限扫描
-    const type = typeof obj.type === "string" ? obj.type.toLowerCase() : "";
-    if (type === "img" || type === "image") {
-      for (const key of ["src", "url", "file"]) {
-        const value = obj[key];
-        if (typeof value === "string" && value) return value;
-      }
-      const attrs = obj.attrs as Record<string, any> | undefined;
-      if (attrs) {
-        for (const key of ["src", "url", "file"]) {
-          const value = attrs[key];
-          if (typeof value === "string" && value) return value;
-        }
-      }
-    }
-
+    if (urlMatch?.[1]) return decodeURIComponent(urlMatch[1]);
+    if (decodedFile) return decodedFile;
     return null;
   }
 
@@ -467,6 +466,7 @@ export function apply(ctx: Context, config: Config) {
     if (!message || typeof message !== "object") return null;
 
     // onebot 风格：raw_message 通常直接包含 [CQ:image,...]，比 h.parse 更稳定
+    let rawImageCandidate: string | null = null;
     const rawCandidates: Array<string | undefined> = [
       message.raw_message,
       message.raw,
@@ -481,12 +481,15 @@ export function apply(ctx: Context, config: Config) {
       const found = extractImageFromContentString(cand);
       if (found) {
         if (isLikelyAvatarLike(found)) continue;
-        return found;
+        rawImageCandidate = found;
+        break;
       }
     }
 
     const directElements = message?.elements;
     if (Array.isArray(directElements)) {
+      const fromPicElements = extractImageSourceFromElements(directElements);
+      if (fromPicElements) return fromPicElements;
       const found = extractStrictMessageImage(directElements);
       if (found) return found;
     }
@@ -502,6 +505,8 @@ export function apply(ctx: Context, config: Config) {
 
     // 常见 onebot 返回体里 message 字段可能就是正文消息段数组
     if (Array.isArray(message?.message)) {
+      const fromPicElements = extractImageSourceFromElements(message.message);
+      if (fromPicElements) return fromPicElements;
       const found = extractStrictMessageImage(message.message);
       if (found) return found;
     }
@@ -510,10 +515,14 @@ export function apply(ctx: Context, config: Config) {
     const data = message?.data;
     if (data && typeof data === "object") {
       if (Array.isArray(data.elements)) {
+        const fromPicElements = extractImageSourceFromElements(data.elements);
+        if (fromPicElements) return fromPicElements;
         const found = extractStrictMessageImage(data.elements);
         if (found) return found;
       }
       if (Array.isArray(data.message)) {
+        const fromPicElements = extractImageSourceFromElements(data.message);
+        if (fromPicElements) return fromPicElements;
         const found = extractStrictMessageImage(data.message);
         if (found) return found;
       }
@@ -526,57 +535,7 @@ export function apply(ctx: Context, config: Config) {
       }
     }
 
-    return null;
-  }
-
-  function extractReplyIdFromUnknown(input: any, depth = 0, seen = new WeakSet<object>()): string | null {
-    if (input == null || depth > 6) return null;
-
-    if (typeof input === "string") {
-      return extractReplyIdFromContent(input);
-    }
-
-    if (Array.isArray(input)) {
-      for (const item of input) {
-        const found = extractReplyIdFromUnknown(item, depth + 1, seen);
-        if (found) return found;
-      }
-      return null;
-    }
-
-    if (typeof input !== "object") return null;
-    if (seen.has(input)) return null;
-    seen.add(input);
-
-    const obj = input as Record<string, any>;
-
-    // 优先从消息文本/原始消息里解析 reply 标记，避免误拿当前消息 message_id
-    for (const key of ["raw_message", "content", "message", "text"]) {
-      const value = obj[key];
-      if (typeof value === "string") {
-        const found = extractReplyIdFromContent(value);
-        if (found) return found;
-      }
-    }
-
-    for (const key of ["id", "messageId", "msgId", "message_id"]) {
-      const value = obj[key];
-      if (typeof value === "string" || typeof value === "number") {
-        return String(value);
-      }
-    }
-
-    for (const key of ["quote", "reply", "source", "message", "data", "attrs", "children", "elements", "content", "event"]) {
-      if (key in obj) {
-        const found = extractReplyIdFromUnknown(obj[key], depth + 1, seen);
-        if (found) return found;
-      }
-    }
-
-    for (const value of Object.values(obj)) {
-      const found = extractReplyIdFromUnknown(value, depth + 1, seen);
-      if (found) return found;
-    }
+    if (rawImageCandidate) return rawImageCandidate;
     return null;
   }
 
@@ -610,6 +569,304 @@ export function apply(ctx: Context, config: Config) {
     return null;
   }
 
+  function normalizeNonZeroId(value: any): string | null {
+    if (typeof value !== "string" && typeof value !== "number") return null;
+    const normalized = String(value).trim();
+    if (!normalized || normalized === "0") return null;
+    return normalized;
+  }
+
+  function expandMessageIdCandidates(value?: string | null): string[] {
+    const normalized = normalizeNonZeroId(value);
+    if (!normalized) return [];
+    const set = new Set<string>([normalized]);
+    if (/^-?\d+$/.test(normalized)) {
+      try {
+        const n = BigInt(normalized);
+        const asUnsigned = BigInt.asUintN(32, n).toString();
+        const asSigned = BigInt.asIntN(32, n).toString();
+        if (asUnsigned !== "0") set.add(asUnsigned);
+        if (asSigned !== "0") set.add(asSigned);
+      } catch {}
+    }
+    return [...set];
+  }
+
+  function buildGetMessageIdCandidates(session: any, quoteId: string): string[] {
+    const normalizedQuoteId = normalizeNonZeroId(quoteId);
+    if (!normalizedQuoteId) return [];
+    if (!/^-?\d+$/.test(normalizedQuoteId)) return [normalizedQuoteId];
+    try {
+      const n = BigInt(normalizedQuoteId);
+      const asUnsigned = BigInt.asUintN(32, n).toString();
+      const asSigned = BigInt.asIntN(32, n).toString();
+      const set = new Set<string>();
+      const platformText = `${session?.platform ?? ""} ${session?.bot?.platform ?? ""}`.toLowerCase();
+      const isOnebotLike = platformText.includes("onebot") || platformText.includes("llbot");
+      if (normalizedQuoteId.startsWith("-")) {
+        // onebot/llbot 里 message_id 可能同时出现“负数签名值”与“无符号值”，按顺序都尝试。
+        // 先试原值可避免“只转无符号导致消息不存在(retcode=1200)”。
+        set.add(normalizedQuoteId);
+        if (asUnsigned !== "0") set.add(asUnsigned);
+        if (!isOnebotLike && asSigned !== "0") set.add(asSigned);
+      } else {
+        set.add(normalizedQuoteId);
+        if (asSigned !== normalizedQuoteId && asSigned !== "0") set.add(asSigned);
+        if (isOnebotLike && asUnsigned !== normalizedQuoteId && asUnsigned !== "0") set.add(asUnsigned);
+      }
+      return [...set];
+    } catch {
+      return [normalizedQuoteId];
+    }
+  }
+
+  function toMaybeNumericMessageId(candidate: string): string | number {
+    if (!/^-?\d+$/.test(candidate)) return candidate;
+    const parsed = Number(candidate);
+    if (Number.isSafeInteger(parsed)) return parsed;
+    return candidate;
+  }
+
+  function normalizeNonEmptyString(value: any): string | null {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim();
+    return normalized || null;
+  }
+
+  function isUsableImageSource(value: string): boolean {
+    return (
+      /^https?:\/\//i.test(value) ||
+      /^file:\/\//i.test(value) ||
+      /^data:image\//i.test(value) ||
+      /^[a-zA-Z]:[\\/]/.test(value) ||
+      value.startsWith("/")
+    );
+  }
+
+  function extractThumbPathSource(thumbPath: any): string | null {
+    const values: string[] = [];
+    if (typeof thumbPath === "string") {
+      values.push(thumbPath);
+    } else if (Array.isArray(thumbPath)) {
+      for (const item of thumbPath) {
+        if (typeof item === "string") values.push(item);
+      }
+    } else if (thumbPath instanceof Map) {
+      for (const item of thumbPath.values()) {
+        if (typeof item === "string") values.push(item);
+      }
+    } else if (thumbPath && typeof thumbPath === "object") {
+      for (const item of Object.values(thumbPath as Record<string, any>)) {
+        if (typeof item === "string") values.push(item);
+      }
+    }
+    for (const value of values) {
+      const normalized = normalizeNonEmptyString(value);
+      if (normalized && isUsableImageSource(normalized)) return normalized;
+    }
+    return null;
+  }
+
+  function extractImageSourceFromPicLike(picLike: any): string | null {
+    if (!picLike || typeof picLike !== "object") return null;
+    const pic = picLike as Record<string, any>;
+    const directCandidates = [
+      pic.sourcePath,
+      pic.source_path,
+      pic.localPath,
+      pic.local_path,
+      pic.filePath,
+      pic.file_path,
+      pic.path,
+    ];
+    for (const value of directCandidates) {
+      const normalized = normalizeNonEmptyString(value);
+      if (normalized && isUsableImageSource(normalized)) return normalized;
+    }
+
+    const thumbSource = extractThumbPathSource(pic.thumbPath ?? pic.thumb_path);
+    if (thumbSource) return thumbSource;
+
+    const urlCandidates = [
+      pic.originImageUrl,
+      pic.originImageURL,
+      pic.url,
+      pic.downloadUrl,
+      pic.resourceUrl,
+    ];
+    for (const value of urlCandidates) {
+      const normalized = normalizeNonEmptyString(value);
+      if (normalized && isUsableImageSource(normalized)) return normalized;
+    }
+
+    return null;
+  }
+
+  function extractImageSourceFromElements(elements: any[]): string | null {
+    for (const el of elements) {
+      const element = el as Record<string, any>;
+      const segmentType = normalizeNonEmptyString(element?.type)?.toLowerCase();
+      if (segmentType === "image" || segmentType === "img") {
+        const data = (element?.data && typeof element.data === "object") ? (element.data as Record<string, any>) : {};
+        const segmentCandidates = [
+          data.url,
+          data.file,
+          data.path,
+          data.src,
+          data.originImageUrl,
+          element?.url,
+          element?.file,
+        ];
+        for (const value of segmentCandidates) {
+          const normalized = normalizeNonEmptyString(value);
+          if (!normalized || !isUsableImageSource(normalized)) continue;
+          if (isLikelyAvatarLike(normalized)) continue;
+          return normalized;
+        }
+      }
+      const source =
+        extractImageSourceFromPicLike(element?.picElement) ??
+        extractImageSourceFromPicLike(element?.picElem) ??
+        extractImageSourceFromPicLike(element?.imageElement);
+      if (source) return source;
+    }
+    return null;
+  }
+
+  function hasSourceTraceMarkers(obj: Record<string, any>): boolean {
+    if (obj.sourceMsgIsIncPic === true) return true;
+    const markerKeys = [
+      "sourceMsgIdInRecords",
+      "sourceMsgTextElems",
+      "sourceMsgText",
+      "sourceMsgSeqInRecords",
+      "replyMsgId",
+      "replayMsgId",
+      "replyMsgSeq",
+      "replayMsgSeq",
+      "replyMsgRootMsgId",
+      "replayMsgRootMsgId",
+      "replyMsgRootSeq",
+      "replayMsgRootSeq",
+      "sourceMsgId",
+      "source_msg_id",
+      "sourceMsgSeq",
+    ];
+    for (const key of markerKeys) {
+      if (obj[key] != null) return true;
+    }
+    return false;
+  }
+
+  function collectSemiRelaxedSources(
+    eventData: any,
+    trackedHint?: { msgId?: string | null; msgSeq?: string | null },
+  ): string[] {
+    const hintIds = expandMessageIdCandidates(trackedHint?.msgId);
+    const hintSeq = normalizeNonZeroId(trackedHint?.msgSeq);
+    const seen = new WeakSet<object>();
+    const sourceSet = new Set<string>();
+    const sources: string[] = [];
+    const pushSource = (value: string | null) => {
+      if (!value || sourceSet.has(value)) return;
+      sourceSet.add(value);
+      sources.push(value);
+    };
+
+    const walk = (node: any, depth: number) => {
+      if (node == null || depth > 10) return;
+      if (typeof node !== "object") return;
+      if (seen.has(node)) return;
+      seen.add(node);
+      const obj = node as Record<string, any>;
+
+      const msgIdCandidates = [
+        obj.msgId,
+        obj.msg_id,
+        obj.id,
+        obj.message_id,
+        obj.sourceMsgIdInRecords,
+        obj.sourceMsgId,
+        obj.replyMsgId,
+        obj.replayMsgId,
+      ]
+        .map(normalizeNonZeroId)
+        .filter(Boolean)
+        .flatMap(value => expandMessageIdCandidates(value as string));
+      const msgSeqCandidates = [
+        obj.msgSeq,
+        obj.msg_seq,
+        obj.seq,
+        obj.message_seq,
+        obj.replyMsgSeq,
+        obj.replayMsgSeq,
+        obj.sourceMsgSeq,
+        obj.sourceMsgSeqInRecords,
+        obj.replyMsgRootSeq,
+        obj.replayMsgRootSeq,
+      ].map(normalizeNonZeroId).filter(Boolean) as string[];
+
+      const hitHint =
+        (hintIds.length > 0 && msgIdCandidates.some(id => hintIds.includes(id))) ||
+        (hintSeq && msgSeqCandidates.includes(hintSeq));
+      const traced = hitHint || hasSourceTraceMarkers(obj);
+
+      if (traced) {
+        if (Array.isArray(obj.sourceMsgTextElems)) {
+          pushSource(extractImageSourceFromElements(obj.sourceMsgTextElems));
+        }
+        if (Array.isArray(obj.records)) {
+          for (const rec of obj.records) {
+            if (!rec || typeof rec !== "object") continue;
+            const recObj = rec as Record<string, any>;
+            if (Array.isArray(recObj.elements)) pushSource(extractImageSourceFromElements(recObj.elements));
+            if (Array.isArray(recObj.message)) pushSource(extractImageSourceFromElements(recObj.message));
+            pushSource(
+              extractImageSourceFromPicLike(recObj.picElement) ??
+              extractImageSourceFromPicLike(recObj.picElem) ??
+              extractImageSourceFromPicLike(recObj.imageElement),
+            );
+          }
+        }
+        if (Array.isArray(obj.elements)) pushSource(extractImageSourceFromElements(obj.elements));
+        if (Array.isArray(obj.message)) pushSource(extractImageSourceFromElements(obj.message));
+        if (Array.isArray(obj.data?.elements)) pushSource(extractImageSourceFromElements(obj.data.elements));
+        if (Array.isArray(obj.data?.message)) pushSource(extractImageSourceFromElements(obj.data.message));
+        pushSource(
+          extractImageSourceFromPicLike(obj.picElement) ??
+          extractImageSourceFromPicLike(obj.picElem) ??
+          extractImageSourceFromPicLike(obj.imageElement),
+        );
+      }
+
+      for (const value of Object.values(obj)) walk(value, depth + 1);
+    };
+
+    walk(eventData, 0);
+    return sources;
+  }
+
+  function buildEventDataCandidates(session: any): Array<{ label: string; data: any }> {
+    const ev = (session as any)?.event;
+    const quote = (session as any)?.quote;
+    const rawCandidates: Array<{ label: string; data: any }> = [
+      { label: "event._data", data: ev?._data },
+      { label: "event.raw", data: ev?.raw },
+      { label: "event", data: ev },
+      { label: "session.quote", data: quote },
+    ];
+    const seen = new Set<any>();
+    const candidates: Array<{ label: string; data: any }> = [];
+    for (const item of rawCandidates) {
+      const data = item.data;
+      if (!data || typeof data !== "object") continue;
+      if (seen.has(data)) continue;
+      seen.add(data);
+      candidates.push(item);
+    }
+    return candidates;
+  }
+
   function extractSourceMsgIdInRecords(eventData: any): string | null {
     const seen = new WeakSet<object>();
     const walk = (node: any, depth: number): string | null => {
@@ -618,8 +875,8 @@ export function apply(ctx: Context, config: Config) {
       if (seen.has(node)) return null;
       seen.add(node);
       const obj = node as Record<string, any>;
-      const v = obj.sourceMsgIdInRecords;
-      if (typeof v === "string" || typeof v === "number") return String(v);
+      const v = normalizeNonZeroId(obj.sourceMsgIdInRecords);
+      if (v) return v;
       for (const value of Object.values(obj)) {
         const found = walk(value, depth + 1);
         if (found) return found;
@@ -629,7 +886,59 @@ export function apply(ctx: Context, config: Config) {
     return walk(eventData, 0);
   }
 
-  function extractPicElementSourcePath(eventData: any, targetMsgId?: string | null): string | null {
+  function extractReplyMsgIdInRecords(eventData: any): string | null {
+    const seen = new WeakSet<object>();
+    const walk = (node: any, depth: number): string | null => {
+      if (node == null || depth > 10) return null;
+      if (typeof node !== "object") return null;
+      if (seen.has(node)) return null;
+      seen.add(node);
+      const obj = node as Record<string, any>;
+      const keys = ["replyMsgId", "replayMsgId", "sourceMsgId", "source_msg_id"];
+      for (const key of keys) {
+        const value = normalizeNonZeroId(obj[key]);
+        if (value) return value;
+      }
+      for (const value of Object.values(obj)) {
+        const found = walk(value, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(eventData, 0);
+  }
+
+  function extractReplyMsgSeqInRecords(eventData: any): string | null {
+    const seen = new WeakSet<object>();
+    const walk = (node: any, depth: number): string | null => {
+      if (node == null || depth > 10) return null;
+      if (typeof node !== "object") return null;
+      if (seen.has(node)) return null;
+      seen.add(node);
+      const obj = node as Record<string, any>;
+      const keys = ["replyMsgSeq", "replayMsgSeq", "sourceMsgSeq", "sourceMsgSeqInRecords"];
+      for (const key of keys) {
+        const value = normalizeNonZeroId(obj[key]);
+        if (value) return value;
+      }
+      for (const value of Object.values(obj)) {
+        const found = walk(value, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(eventData, 0);
+  }
+
+  function extractPicElementSourcePath(
+    eventData: any,
+    target?: { msgId?: string | null; msgSeq?: string | null } | null,
+  ): string | null {
+    const targetMsgId = normalizeNonZeroId(target?.msgId);
+    const targetMsgIdCandidates = expandMessageIdCandidates(targetMsgId);
+    const targetMsgSeq = normalizeNonZeroId(target?.msgSeq);
+    const hasTarget = Boolean(targetMsgIdCandidates.length > 0 || targetMsgSeq);
+    if (!hasTarget) return null;
     const seen = new WeakSet<object>();
     const walk = (node: any, depth: number): string | null => {
       if (node == null || depth > 10) return null;
@@ -638,23 +947,54 @@ export function apply(ctx: Context, config: Config) {
       seen.add(node);
       const obj = node as Record<string, any>;
 
-      // 优先：如果当前对象是“某条消息”，且 msgId 命中目标，则在 elements 里找 picElement.sourcePath
-      const msgId = obj.msgId ?? obj.msg_id ?? obj.id;
-      if (targetMsgId && msgId != null && String(msgId) === targetMsgId) {
-        const elements = obj.elements;
-        if (Array.isArray(elements)) {
-          for (const el of elements) {
-            const sp = (el as any)?.picElement?.sourcePath;
-            if (typeof sp === "string" && sp) return sp;
-          }
+      // 优先：如果当前对象是“某条消息”，且 msgId/msgSeq 命中目标，则只提取该消息内的图片来源。
+      const msgIdCandidates = [
+        obj.msgId,
+        obj.msg_id,
+        obj.id,
+        obj.message_id,
+        obj.sourceMsgIdInRecords,
+        obj.sourceMsgId,
+        obj.replyMsgId,
+        obj.replayMsgId,
+      ]
+        .map(normalizeNonZeroId)
+        .filter(Boolean)
+        .flatMap(value => expandMessageIdCandidates(value as string));
+      const msgSeqCandidates = [
+        obj.msgSeq,
+        obj.msg_seq,
+        obj.seq,
+        obj.message_seq,
+        obj.replyMsgSeq,
+        obj.replayMsgSeq,
+        obj.sourceMsgSeq,
+        obj.sourceMsgSeqInRecords,
+        obj.replyMsgRootSeq,
+        obj.replayMsgRootSeq,
+      ].map(normalizeNonZeroId).filter(Boolean) as string[];
+      const isTargetMessage =
+        (targetMsgIdCandidates.length > 0 && msgIdCandidates.some(id => targetMsgIdCandidates.includes(id))) ||
+        (targetMsgSeq && msgSeqCandidates.includes(targetMsgSeq));
+      if (isTargetMessage) {
+        const arrays = [
+          obj.elements,
+          obj.sourceMsgTextElems,
+          obj.message,
+          obj.records,
+          obj.data?.elements,
+          obj.data?.message,
+        ];
+        for (const arr of arrays) {
+          if (!Array.isArray(arr)) continue;
+          const found = extractImageSourceFromElements(arr);
+          if (found) return found;
         }
-      }
-
-      // 如果没有提供目标 msgId，再尝试直接提取 picElement.sourcePath
-      // 但一旦提供了目标 msgId，就严格只从“该消息对象”里取，避免误存头像/预览资源。
-      if (!targetMsgId) {
-        const directSp = obj.picElement?.sourcePath;
-        if (typeof directSp === "string" && directSp) return directSp;
+        const directSource =
+          extractImageSourceFromPicLike(obj.picElement) ??
+          extractImageSourceFromPicLike(obj.picElem) ??
+          extractImageSourceFromPicLike(obj.imageElement);
+        if (directSource) return directSource;
       }
 
       for (const value of Object.values(obj)) {
@@ -664,6 +1004,81 @@ export function apply(ctx: Context, config: Config) {
       return null;
     };
     return walk(eventData, 0);
+  }
+
+  function resolveFallbackSourcePathFromEvent(
+    session: any,
+    diagnostics?: string[],
+    trackedHint?: { msgId?: string | null; msgSeq?: string | null },
+  ): string | null {
+    const candidates = buildEventDataCandidates(session);
+    const hintMsgId = normalizeNonZeroId(trackedHint?.msgId);
+    const hintMsgSeq = normalizeNonZeroId(trackedHint?.msgSeq);
+    let lastTargetMsgId: string | null = null;
+    let lastTargetMsgSeq: string | null = null;
+    if (hintMsgId) lastTargetMsgId = hintMsgId;
+    if (hintMsgSeq) lastTargetMsgSeq = hintMsgSeq;
+    for (const item of candidates) {
+      const sourceMsgIdInRecords = normalizeNonZeroId(extractSourceMsgIdInRecords(item.data));
+      const replyMsgId = normalizeNonZeroId(extractReplyMsgIdInRecords(item.data));
+      const replyMsgSeq = normalizeNonZeroId(extractReplyMsgSeqInRecords(item.data));
+      const trackedMsgId = sourceMsgIdInRecords ?? replyMsgId ?? hintMsgId;
+      const trackedMsgSeq = replyMsgSeq ?? hintMsgSeq;
+      if (trackedMsgId) lastTargetMsgId = trackedMsgId;
+      if (trackedMsgSeq) lastTargetMsgSeq = trackedMsgSeq;
+      if (!trackedMsgId && !trackedMsgSeq) {
+        if (diagnostics) {
+          diagnostics.push(
+            `fallbackSourcePath=skip from=${item.label} reason=no-tracking-fields`,
+          );
+        }
+        continue;
+      }
+      const fallbackSourcePath = extractPicElementSourcePath(item.data, { msgId: trackedMsgId, msgSeq: trackedMsgSeq });
+      if (!fallbackSourcePath) {
+        const relaxedSources = collectSemiRelaxedSources(item.data, {
+          msgId: trackedMsgId,
+          msgSeq: trackedMsgSeq,
+        });
+        if (relaxedSources.length === 1) {
+          if (diagnostics) {
+            diagnostics.push(
+              `fallbackSourcePath=found from=${item.label} mode=semi-relaxed ` +
+              `targetMsgId=${trackedMsgId ?? "none"} targetMsgSeq=${trackedMsgSeq ?? "none"}`,
+            );
+          }
+          return relaxedSources[0];
+        }
+        if (relaxedSources.length > 1) {
+          if (diagnostics) {
+            diagnostics.push(
+              `fallbackSourcePath=ambiguous from=${item.label} mode=semi-relaxed count=${relaxedSources.length} ` +
+              `targetMsgId=${trackedMsgId ?? "none"} targetMsgSeq=${trackedMsgSeq ?? "none"}`,
+            );
+          }
+          continue;
+        }
+        if (diagnostics) {
+          diagnostics.push(
+            `fallbackSourcePath=miss from=${item.label} targetMsgId=${trackedMsgId ?? "none"} targetMsgSeq=${trackedMsgSeq ?? "none"}`,
+          );
+        }
+        continue;
+      }
+      if (diagnostics) {
+        diagnostics.push(
+          `fallbackSourcePath=found from=${item.label} mode=strict ` +
+          `targetMsgId=${trackedMsgId ?? "none"} targetMsgSeq=${trackedMsgSeq ?? "none"}`,
+        );
+      }
+      return fallbackSourcePath;
+    }
+    if (diagnostics) {
+      diagnostics.push(
+        `fallbackSourcePath=none targetMsgId=${lastTargetMsgId ?? "none"} targetMsgSeq=${lastTargetMsgSeq ?? "none"}`,
+      );
+    }
+    return null;
   }
 
   /**
@@ -678,53 +1093,145 @@ export function apply(ctx: Context, config: Config) {
     const rawContent = session?.__imageSaverRawContent ?? session?.content;
     diagnostics.push(`rawContent=${summarizeValue(rawContent)}`);
 
-    // 只认“被引用原消息”中的图片，不再从当前命令消息或事件整体宽泛扫图。
-    const toIdString = (value: any): string | null =>
-      (typeof value === "string" || typeof value === "number") ? String(value) : null;
+    const directQuoteImage = extractStrictQuotedImageFromMessageObject(session?.quote);
+    if (directQuoteImage) return directQuoteImage;
 
     const currentMessageId =
-      toIdString(session?.event?._data?.message_id) ??
-      toIdString(session?.event?._data?.messageId) ??
-      toIdString(session?.event?.message_id) ??
-      toIdString(session?.event?.messageId) ??
-      toIdString(session?.event?.id) ??
-      toIdString(session?.event?._data?.id);
+      normalizeNonZeroId(session?.event?._data?.message_id) ??
+      normalizeNonZeroId(session?.event?._data?.messageId) ??
+      normalizeNonZeroId(session?.event?.message_id) ??
+      normalizeNonZeroId(session?.event?.messageId) ??
+      normalizeNonZeroId(session?.event?.id) ??
+      normalizeNonZeroId(session?.event?._data?.id);
 
     const eventRawMessage =
       session?.event?._data?.raw_message ??
       session?.event?.raw?.raw_message ??
       session?.event?.raw_message;
 
-    const replyIdFromRawMessage = extractReplyIdFromContent(eventRawMessage);
+    const replyIdFromRawMessage = normalizeNonZeroId(extractReplyIdFromContent(eventRawMessage));
+    const replyIdFromQuoteObject =
+      normalizeNonZeroId(session?.quote?.id) ??
+      normalizeNonZeroId(session?.quote?.messageId) ??
+      normalizeNonZeroId(session?.quote?.msgId);
+    let replyIdFromEventMetadata: string | null = null;
+    let replySeqFromEventMetadata: string | null = null;
+    for (const item of buildEventDataCandidates(session)) {
+      const candidateSourceId = normalizeNonZeroId(extractSourceMsgIdInRecords(item.data));
+      const candidateReplyId = normalizeNonZeroId(extractReplyMsgIdInRecords(item.data));
+      const candidateId = candidateSourceId ?? candidateReplyId;
+      const candidateSeq = normalizeNonZeroId(extractReplyMsgSeqInRecords(item.data));
+      if (!candidateId && !candidateSeq) continue;
+      if (candidateId) replyIdFromEventMetadata = candidateId;
+      if (candidateSeq) replySeqFromEventMetadata = candidateSeq;
+      diagnostics.push(
+        `reply evidence=${item.label}.` +
+        `${candidateSourceId ? "sourceMsgIdInRecords" : ""}` +
+        `${!candidateSourceId && candidateReplyId ? "reply/replayMsgId" : ""}` +
+        `${candidateId && candidateSeq ? "+" : ""}` +
+        `${candidateSeq ? "replyMsgSeq" : ""}`,
+      );
+      if (candidateId) break;
+    }
+
+    const quoteId =
+      replyIdFromRawMessage ??
+      replyIdFromQuoteObject ??
+      replyIdFromEventMetadata;
+    const hasReplyEvidence = Boolean(quoteId || replySeqFromEventMetadata);
 
     // 没有明确的引用标识时，不允许回查 getMessage（避免空发指令触发 get_msg）。
-    if (!replyIdFromRawMessage) {
-      diagnostics.push("reply evidence missing(no CQ:reply). skip getMessage");
+    if (!hasReplyEvidence) {
+      diagnostics.push("reply evidence missing(raw_message/session.quote/sourceMsgIdInRecords/replyMsgId/replyMsgSeq). skip getMessage");
+      const fallbackSourcePath = resolveFallbackSourcePathFromEvent(session, diagnostics, {
+        msgId: replyIdFromQuoteObject ?? replyIdFromRawMessage,
+        msgSeq: replySeqFromEventMetadata,
+      });
+      if (fallbackSourcePath) return fallbackSourcePath;
+
       logger.warn(`[存图] 抓图失败。原因链路：${diagnostics.join(" | ")}`);
       return null;
     }
 
-    const quoteId = replyIdFromRawMessage;
-    if (currentMessageId && quoteId === currentMessageId) {
-      diagnostics.push("reply id equals current message id. skip");
+    if (quoteId && currentMessageId && quoteId === currentMessageId) {
+      diagnostics.push("reply id equals current message id. skip getMessage");
+      const fallbackSourcePath = resolveFallbackSourcePathFromEvent(session, diagnostics, {
+        msgId: quoteId,
+        msgSeq: replySeqFromEventMetadata,
+      });
+      if (fallbackSourcePath) return fallbackSourcePath;
       logger.warn(`[存图] 抓图失败。原因链路：${diagnostics.join(" | ")}`);
       return null;
     }
-    diagnostics.push(`quoteId=${quoteId}`);
+    if (quoteId) diagnostics.push(`quoteId=${quoteId}`);
+    else diagnostics.push(`quoteId=none replySeq=${replySeqFromEventMetadata ?? "none"} skip getMessage`);
 
     const channelId = session?.channelId;
     const getMessage = session?.bot?.getMessage;
-    if (typeof getMessage === "function") {
-      const tryFetches: Array<{ label: string; run: () => Promise<any> }> = [
-        // 尽量用最直接的“消息 id”回查
-        { label: "getMessage(quoteId)", run: () => getMessage.call(session.bot, quoteId) },
-      ];
-      if (channelId) {
-        tryFetches.push(
-          { label: "getMessage(channelId, quoteId)", run: () => getMessage.call(session.bot, channelId, quoteId) },
-          { label: "getMessage(channelId, quoteId, guildId)", run: () => getMessage.call(session.bot, channelId, quoteId, session?.guildId) },
-          { label: "getMessage(quoteId, channelId)", run: () => getMessage.call(session.bot, quoteId, channelId) },
-          { label: "getMessage(quoteId, channelId, guildId)", run: () => getMessage.call(session.bot, quoteId, channelId, session?.guildId) },
+    const internal = (session as any)?.bot?.internal;
+    if (quoteId) {
+      const getMessageIdCandidates = buildGetMessageIdCandidates(session, quoteId);
+      const platformText = `${session?.platform ?? ""} ${session?.bot?.platform ?? ""}`.toLowerCase();
+      const isOnebotLike = platformText.includes("onebot") || platformText.includes("llbot");
+      diagnostics.push(
+        `getMessageIds=${getMessageIdCandidates.length ? getMessageIdCandidates.join(",") : "none"}`,
+      );
+      const tryFetches: Array<{ label: string; run: () => Promise<any> }> = [];
+      const canUseGetMessage = typeof getMessage === "function";
+      const canUseInternal = Boolean(internal && typeof internal === "object");
+      let internalGetMsgMethod: { name: "get_msg" | "getMsg"; fn: (...args: any[]) => any } | null = null;
+
+      // onebot/llbot 场景优先走内部 get_msg，减少 getMessage 包装层参数丢失风险。
+      if (canUseInternal && isOnebotLike) {
+        const internalAny = internal as any;
+        if (typeof internalAny?.get_msg === "function") {
+          internalGetMsgMethod = { name: "get_msg", fn: internalAny.get_msg };
+        } else if (typeof internalAny?.getMsg === "function") {
+          internalGetMsgMethod = { name: "getMsg", fn: internalAny.getMsg };
+        }
+        diagnostics.push(
+          `internalMsgMethod=${internalGetMsgMethod?.name ?? "none"}`,
+        );
+        for (const candidate of getMessageIdCandidates) {
+          const internalMessageId = toMaybeNumericMessageId(candidate);
+          if (!internalGetMsgMethod) continue;
+          tryFetches.push({
+            label: `internal.${internalGetMsgMethod.name}(${candidate})#scalar`,
+            run: () => Promise.resolve(internalGetMsgMethod!.fn.call(internal, internalMessageId)),
+          });
+        }
+      }
+
+      const shouldUseGetMessageWrapper = canUseGetMessage && (!isOnebotLike || !internalGetMsgMethod);
+      if (shouldUseGetMessageWrapper) {
+        for (const candidate of getMessageIdCandidates) {
+          if (isOnebotLike) {
+            // onebot/llbot 在部分实现里 getMessage(channelId, messageId) 可能丢参，回退时仅传 messageId。
+            tryFetches.push({
+              label: `getMessage(${candidate})#onebot-safe`,
+              run: () => getMessage.call(session.bot, candidate),
+            });
+          } else if (channelId) {
+            // Satori 协议标准签名：getMessage(channelId, messageId)
+            // 避免在 onebot/llbot 适配链路中触发 get_msg 空参数调用。
+            tryFetches.push({
+              label: `getMessage(channelId,${candidate})`,
+              run: () => getMessage.call(session.bot, channelId, candidate),
+            });
+          } else {
+            tryFetches.push({
+              label: `getMessage(${candidate})`,
+              run: () => getMessage.call(session.bot, candidate),
+            });
+          }
+        }
+      } else if (canUseGetMessage && isOnebotLike) {
+        diagnostics.push("skip getMessage wrapper in onebot-like platform");
+      }
+
+      if (!tryFetches.length) {
+        diagnostics.push(
+          `quote fetch unavailable internal=${canUseInternal} getMessage=${canUseGetMessage} channelId=${channelId ?? "none"}`,
         );
       }
 
@@ -738,21 +1245,13 @@ export function apply(ctx: Context, config: Config) {
           diagnostics.push(`${item.label}=error:${err?.message ?? err}`);
         }
       }
-    } else {
-      diagnostics.push(`getMessage unavailable=${typeof getMessage !== "function"} channelId=${channelId ?? "none"}`);
     }
 
-    // 回查失败/引用链断裂（比如 replayMsgId=0）时，直接从事件数据里找源图片 picElement.sourcePath
-    const eventData = session?.event?._data ?? session?.event?.raw ?? session?.event;
-    const sourceMsgIdInRecords = extractSourceMsgIdInRecords(eventData);
-    // 只有拿到目标 msgId 才允许从事件中提取 picElement.sourcePath
-    // 否则（msgId 缺失）会退化为全局扫图，可能误存非目标资源（例如缩略图/预览）。
-    const fallbackSourcePath = sourceMsgIdInRecords
-      ? extractPicElementSourcePath(eventData, sourceMsgIdInRecords)
-      : null;
-    diagnostics.push(
-      `fallbackSourcePath=${fallbackSourcePath ? "found" : "none"} targetMsgId=${sourceMsgIdInRecords ?? "none"}`,
-    );
+    // 引用消息直查失败或引用关系断裂（如 replayMsgId=0）时，再走字段追踪兜底。
+    const fallbackSourcePath = resolveFallbackSourcePathFromEvent(session, diagnostics, {
+      msgId: quoteId,
+      msgSeq: replySeqFromEventMetadata,
+    });
     if (fallbackSourcePath) return fallbackSourcePath;
 
     logger.warn(
@@ -811,21 +1310,22 @@ export function apply(ctx: Context, config: Config) {
       }
 
       try {
-        await saveImageForScope(scopeKey, imgUrl);
+        await saveImageForScope(scopeKey, imgUrl, session);
         return "✅ 存图成功！";
       } catch (err: any) {
         logger.error("存图失败：", err);
+        logger.warn(`[存图] 主下载链路失败 url=${imgUrl} err=${err?.message ?? err}`);
         // 若下载失败/链接不可达，尝试从事件记录直接取本地 picElement.sourcePath 作为兜底
         try {
-          const ev = (session as any)?.event;
-          const eventData = ev?._data ?? ev?.raw ?? ev;
-          const sourceMsgIdInRecords = extractSourceMsgIdInRecords(eventData);
-          if (sourceMsgIdInRecords) {
-            const fallbackSourcePath = extractPicElementSourcePath(eventData, sourceMsgIdInRecords);
-            if (fallbackSourcePath && fallbackSourcePath !== imgUrl) {
-              await saveImageForScope(scopeKey, fallbackSourcePath);
-              return "✅ 存图成功！";
-            }
+          const fallbackSourcePath = resolveFallbackSourcePathFromEvent(session, undefined, {
+            msgId:
+              normalizeNonZeroId((session as any)?.quote?.id) ??
+              normalizeNonZeroId((session as any)?.quote?.messageId) ??
+              normalizeNonZeroId((session as any)?.quote?.msgId),
+          });
+          if (fallbackSourcePath && fallbackSourcePath !== imgUrl) {
+            await saveImageForScope(scopeKey, fallbackSourcePath, session);
+            return "✅ 存图成功！";
           }
         } catch (err2: any) {
           logger.error("存图回退失败：", err2);
@@ -882,9 +1382,16 @@ export function apply(ctx: Context, config: Config) {
   // ── 指令：存图模式（管理员）──────────────────────────────────────────────────
   const modeCommand = ctx
     .command(`${modeCommandTrigger} [mode:string]`, "管理员切换当前群存图模式（共享/个人，需使用 ! 前缀）")
+    .userFields(["authority"])
     .action(async ({ session }, modeText) => {
       if (!session?.guildId) return "此指令仅限群聊使用";
-      if (!canUseModeCommand(session)) return;
+      if (!canUseModeCommand(session)) {
+        const authority = readAuthority(session?.user?.authority) ?? readAuthority((session as any)?.authority);
+        logger.info(
+          `[模式切换] 拒绝 userId=${session?.userId ?? "none"} guildId=${session?.guildId ?? "none"} authority=${authority ?? "none"}：非白名单且非超级管理员`,
+        );
+        return "❌ 你没有权限切换存图模式";
+      }
 
       const guildId = session.guildId;
       const normalizedMode = normalizeMode(modeText);
